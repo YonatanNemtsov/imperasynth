@@ -367,17 +367,21 @@ def get_variables_defined_in_node(ast: BlockNode, node_pos: ASTNodePosition) -> 
 
         elif isinstance(child, IfElseNode):
             else_block = child.else_block
-            final_assignment: DirectAssignNode = else_block.children[-1]
-            for v in final_assignment.target_vars:
-                if v and v[0] == 'x':
-                    defined.add(v)
+            if else_block.children:
+                final_assignment = else_block.children[-1]
+                if isinstance(final_assignment, DirectAssignNode):
+                    for v in final_assignment.target_vars:
+                        if v and v[0] == 'x':
+                            defined.add(v)
 
         elif isinstance(child, WhileNode):
             while_block = child.block
-            final_assignment: DirectAssignNode = while_block.children[-1]
-            for v in final_assignment.target_vars:
-                if v and v[0] == 'x':
-                    defined.add(v)
+            if while_block.children:
+                final_assignment = while_block.children[-1]
+                if isinstance(final_assignment, DirectAssignNode):
+                    for v in final_assignment.target_vars:
+                        if v and v[0] == 'x':
+                            defined.add(v)
 
     return defined
 
@@ -473,18 +477,20 @@ def get_unused_variables_in_ast(ast: BlockNode) -> list[str]:
                     used.add(v)
 
         elif isinstance(last, IfElseNode):
-            final = last.else_block.children[-1]
-            if isinstance(final, DirectAssignNode):
-                for v in final.source_vars:
-                    if v and v[0] == "x":
-                        used.add(v)
+            if last.else_block.children:
+                final = last.else_block.children[-1]
+                if isinstance(final, DirectAssignNode):
+                    for v in final.source_vars:
+                        if v and v[0] == "x":
+                            used.add(v)
 
         elif isinstance(last, WhileNode):
-            final = last.block.children[-1]
-            if isinstance(final, DirectAssignNode):
-                for v in final.source_vars:
-                    if v and v[0] == "x":
-                        used.add(v)
+            if last.block.children:
+                final = last.block.children[-1]
+                if isinstance(final, DirectAssignNode):
+                    for v in final.source_vars:
+                        if v and v[0] == "x":
+                            used.add(v)
 
     unused = defined - used
     return sorted(unused)

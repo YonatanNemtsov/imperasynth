@@ -4,9 +4,8 @@ from .searchers_utils import *
 
 from queue import PriorityQueue
 from collections import deque
-from itertools import product
+from itertools import permutations, product
 from typing import Hashable, List, Tuple, Dict, Any
-from itertools import product
 
 ActionGroup = list[ShortAction]
 
@@ -281,6 +280,94 @@ def find_possible_start_if_actions(group_indices: set[int]) -> list[set[int]]:
 
 def find_possible_end_if_actions(group_indices: set[int]) -> list[set[int]]:
     return [group_indices]
+
+################################ Execute If-Else Actions ##########################################
+
+def find_possible_execute_if_else_actions(group_indices: set[int]) -> list[set[int]]:
+    """Per-iteration execute-phase split: which traces took the if branch
+    on this iteration? All subsets of group_indices, INCLUDING the empty
+    set (everyone took else) and the full set (everyone took if). Differs
+    from find_possible_start_if_actions which excludes both extremes
+    because at build time those would leave a dead branch.
+    """
+    from itertools import chain, combinations
+    s = list(group_indices)
+    return [set(subset) for subset in chain.from_iterable(combinations(s, r) for r in range(0, len(s) + 1))]
+
+################################ Start While Actions ##########################################
+
+def find_possible_start_while_actions(group_indices: set[int]) -> list[set[int]]:
+    """Return all non-empty subsets of group_indices (including the full set).
+
+    Each subset represents the traces that enter the while loop body at
+    least once. Traces in group_indices but not in the subset skip the loop
+    entirely. Differs from find_possible_start_if_actions: includes the full
+    set, since a while loop can apply to all traces (no else branch needed).
+    """
+    from itertools import chain, combinations
+    s = list(group_indices)
+    all_subsets = chain.from_iterable(combinations(s, r) for r in range(1, len(s) + 1))
+    return [set(subset) for subset in all_subsets]
+
+################################ End While Actions ##########################################
+
+def find_possible_end_while_actions(
+    traces: list['SimpleCompEnv'],
+    variable_states: list[dict[str, 'ObjId']],
+    body_var_names: set[str],
+    while_indices: set[int],
+) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    """
+    Enumerate possible (target_vars, source_vars) rebindings at end of while body.
+
+    target_vars are pre-loop variable names (in scope before the loop, surviving
+    iter 1) that should be updated. source_vars are body-defined names supplying
+    the new values. Each (target, source) pair must agree on value type across
+    all active traces; resulting tuples have distinct targets and distinct sources.
+    """
+    if not while_indices:
+        return []
+
+    rep = min(while_indices)
+
+    # Candidate targets: pre-loop names (not defined in body), in scope for all active traces.
+    candidate_targets = [
+        v for v in variable_states[rep].keys()
+        if v not in body_var_names and all(v in variable_states[i] for i in while_indices)
+    ]
+
+    # Candidate sources: body-defined names, in scope for all active traces.
+    candidate_sources = [
+        v for v in variable_states[rep].keys()
+        if v in body_var_names and all(v in variable_states[i] for i in while_indices)
+    ]
+
+    valid_pairs: list[tuple[str, str]] = []
+    for tgt in candidate_targets:
+        tgt_type = traces[rep].objects[variable_states[rep][tgt]].value_type
+        for src in candidate_sources:
+            ok = True
+            for i in while_indices:
+                if traces[i].objects[variable_states[i][tgt]].value_type != tgt_type:
+                    ok = False
+                    break
+                if traces[i].objects[variable_states[i][src]].value_type != tgt_type:
+                    ok = False
+                    break
+            if ok:
+                valid_pairs.append((tgt, src))
+
+    results: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    for n in range(1, len(valid_pairs) + 1):
+        for combo in permutations(valid_pairs, n):
+            targets, sources = zip(*combo)
+            if len(set(targets)) == len(set(sources)) == n:
+                target_to_source = dict(zip(targets, sources))
+                ordered_targets = tuple(sorted(targets))
+                ordered_sources = tuple(target_to_source[t] for t in ordered_targets)
+                results.add((ordered_targets, ordered_sources))
+
+    return list(results)
 
 ################################ End Else Actions ##########################################
 

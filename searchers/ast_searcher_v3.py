@@ -113,9 +113,12 @@ def transition_start_while_option(construction_frontier: ConstructionFrontier, c
     while_block_exec_pos = exec_pos.enter_context().next_line().enter_context()
     building_while_options = {AUG_FUNC_CALL, AUG_START_IF, AUG_START_WHILE, AUG_END_WHILE}
     building_while_frontier = make_frontier(while_block_exec_pos, building_while_options, group_indices, choice_indices_while)
-    
-    
-    executing_while_frontier = make_frontier(exec_pos.exit_context(), {AUG_ENTER_WHILE, AUG_SKIP_WHILE}, choice_indices_while, choice_indices_while)
+
+
+    # Executing frontier sits AT the WhileNode (same exec_pos as start_while):
+    # transition_enter_while_option does enter_context().next_line() to reach the body,
+    # which only works if exec_pos is at the WhileNode itself, not one level above.
+    executing_while_frontier = make_frontier(exec_pos, {AUG_ENTER_WHILE, AUG_SKIP_WHILE}, choice_indices_while, choice_indices_while)
 
     ep_parent = exec_pos.next_line()
     parent_exec_pos = ep_parent
@@ -207,13 +210,14 @@ def transition_execute_if_else_option(construction_frontier: ConstructionFrontie
     else_indices = parent_for_if_level - if_indices
 
 
-    ep_if = exec_pos.enter_context().next_line().enter_context()
-    if_exec_pos = ep_if
+    # Land AT the body block (not inside): execute_block's transition does its
+    # own enter_context to reach the first child. Cf. transition_enter_while_option,
+    # which uses the same `enter_context().next_line()` pattern (no trailing
+    # enter_context) for the same reason.
+    if_exec_pos = exec_pos.enter_context().next_line()
     if_frontier = make_frontier(if_exec_pos, {AUG_EXECUTE_BLOCK}, parent_for_if_level, if_indices)
 
-    # ELSE branch
-    ep_else = exec_pos.enter_context().next_line().next_line().enter_context()
-    else_exec_pos = ep_else
+    else_exec_pos = exec_pos.enter_context().next_line().next_line()
     else_frontier = make_frontier(else_exec_pos, {AUG_EXECUTE_BLOCK}, parent_for_if_level, else_indices)
 
     return (else_frontier, if_frontier)
@@ -435,6 +439,55 @@ def apply_augmentation_end_if_group(annotated_ast_group: AnnotatedAstGroup) -> A
     new_ast = augment_ast_end_if_simple(annotated_ast_group.ast)
     augmented_asts = [apply_augmentation_if_start_end(annot_ast, new_ast) for annot_ast in annotated_ast_group.annot_asts]
     return AnnotatedAstGroup(augmented_asts)
+
+def augment_ast_start_while(ast: BlockNode, insertion_pos: ASTNodePosition) -> BlockNode:
+    """Insert a fresh WhileNode (with TBD condition and empty body) at insertion_pos."""
+    new_while_node = WhileNode(BoolExprNode(TBD_CONDITIONAL, []), BlockNode([]))
+    new_ast = ast.copy()
+    new_ast.insert_node(insertion_pos, new_while_node)
+    return new_ast
+
+
+def apply_augmentation_start_while_group(annotated_ast_group: AnnotatedAstGroup, exec_position: ExecutionPositionTuple) -> AnnotatedAstGroup:
+    new_ast = augment_ast_start_while(annotated_ast_group.ast, exec_position[0])
+    augmented_asts = [apply_augmentation_if_start_end(annot_ast, new_ast) for annot_ast in annotated_ast_group.annot_asts]
+    return AnnotatedAstGroup(augmented_asts)
+
+
+def augment_ast_end_while(ast: BlockNode, insertion_pos: ASTNodePosition, target_vars: tuple[str], source_vars: tuple[str]) -> BlockNode:
+    """Append a DirectAssignNode at the end of a while body — the rebinding step
+    that lets the next iteration see updated values bound to the loop variable names.
+    """
+    new_final_assign_node = DirectAssignNode(target_vars, source_vars)
+    new_ast = ast.copy()
+    new_ast.insert_node(insertion_pos, new_final_assign_node)
+    return new_ast
+
+
+def apply_augmentation_end_while_group(
+    annotated_ast_group: AnnotatedAstGroup,
+    exec_position: ExecutionPositionTuple,
+    target_vars: tuple[str],
+    source_vars: tuple[str],
+    group_indices: set[int],
+) -> AnnotatedAstGroup:
+    """End of while body: optionally insert a DirectAssign rebinding (similar
+    to end_else). If target_vars is empty, this is a no-op AST refresh.
+    """
+    if not target_vars:
+        new_ast = annotated_ast_group.ast.copy()
+        augmented_asts = [apply_augmentation_if_start_end(annot_ast, new_ast) for annot_ast in annotated_ast_group.annot_asts]
+        return AnnotatedAstGroup(augmented_asts)
+
+    new_ast = augment_ast_end_while(annotated_ast_group.ast, exec_position[0], target_vars, source_vars)
+    augmented_asts = [
+        apply_augmentation_else_end(annot_ast, new_ast, exec_position, target_vars, source_vars)
+        if i in group_indices
+        else apply_augmentation_no_action(annot_ast, new_ast, exec_position, NO_ACTION)
+        for i, annot_ast in enumerate(annotated_ast_group.annot_asts)
+    ]
+    return AnnotatedAstGroup(augmented_asts)
+
 
 def apply_augmentation_end_else_group(annotated_ast_group: AnnotatedAstGroup, exec_position: ExecutionPositionTuple, target_vars: tuple[str], source_vars: tuple[str], group_indices: set[int]) -> AnnotatedAstGroup:
     new_ast = augment_ast_end_else(annotated_ast_group.ast, exec_position[0], target_vars, source_vars)
