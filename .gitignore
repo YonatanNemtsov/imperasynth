@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Notebooks — kept locally as scratchpad, never committed
+notebooks/
+.ipynb_checkpoints/
+
+# Scratch / generated
+tmp/
+images/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
