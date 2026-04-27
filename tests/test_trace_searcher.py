@@ -9,8 +9,8 @@ The trace searcher provides:
 These tests exercise each piece on a tiny "sum of list" problem.
 """
 from core_lang_env.comp_env import BoolFunction, Function
-from searchers_utils import Problem, propagate_importance_multi
-from trace_searcher import (
+from searchers.searchers_utils import Problem, propagate_importance_multi
+from searchers.trace_searcher import (
     NO_ACTION,
     RETURN_FUNC_NAME,
     TraceGroup,

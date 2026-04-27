@@ -1,6 +1,6 @@
 from core_lang_env.comp_env import *
 from core_lang_env.syntax_tree import *
-from searchers_utils import *
+from .searchers_utils import *
 
 from queue import PriorityQueue
 from collections import deque

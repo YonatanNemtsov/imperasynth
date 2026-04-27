@@ -4,9 +4,6 @@
 
 ASTNodePosition = tuple[int]
 
-class ASTSignature:
-    pass
-
 class ASTNode:
     def copy(self) -> 'ASTNode':
         raise NotImplementedError("Subclasses must implement copy()")
@@ -169,22 +166,6 @@ class BoolExprNode(ASTNode):
     def __repr__(self):
         return f'BoolExprNode({self.bool_func}, {self.arg_names})'
     
-class IfNode(ASTNode):
-    """ DEPRECATED if (bool expression) {code block} """
-    def __init__(self, bool_expr: BoolExprNode, block: BlockNode):
-        self.bool_expr = bool_expr  # (var, op, value)
-        self.block = block  # List of ASTNode
-    
-    def copy(self) -> 'IfNode':
-        return IfNode(self.bool_expr.copy(), self.block.copy())
-
-class ElseNode(ASTNode):
-    """DEPRECATED"""
-    def __init__(self, block: BlockNode):
-        self.block = block
-    def copy(self) -> 'ElseNode':
-        return ElseNode(self.block.copy())
-
 class IfElseNode(ASTNode):
     def __init__(self, bool_expr: BoolExprNode, if_block: BlockNode, else_block: BlockNode):
         self.bool_expr = bool_expr
@@ -374,8 +355,6 @@ def visualize_ast(node: 'ASTNode', graph=None, parent_id=None, edge_label='') ->
         label = f'FuncAssign: {", ".join(node.var_names)}\n{node.func_name}({", ".join(node.arg_names)})'
     elif isinstance(node, BoolExprNode):
         label = f'BoolExpr\n{node.bool_func}({", ".join(node.arg_names)})'
-    elif isinstance(node, IfNode):
-        label = 'If'
     elif isinstance(node, IfElseNode):
         label = 'IfElse'
     elif isinstance(node, WhileNode):
@@ -398,10 +377,6 @@ def visualize_ast(node: 'ASTNode', graph=None, parent_id=None, edge_label='') ->
     if isinstance(node, BlockNode):
         for i, stmt in enumerate(node.statements):
             visualize_ast(stmt, graph, node_id, f'stmt {i}')
-    
-    elif isinstance(node, IfNode):
-        visualize_ast(node.bool_expr, graph, node_id, 'condition')
-        visualize_ast(node.block, graph, node_id, 'body')
     
     elif isinstance(node, IfElseNode):
         visualize_ast(node.bool_expr, graph, node_id, 'condition')

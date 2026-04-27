@@ -4,7 +4,7 @@
 ASTs (which boolean held when the if branch was taken vs the else, etc.)
 and searches for a small bool program that explains the labels.
 """
-from condition_searcher import (
+from searchers.condition_searcher import (
     create_bool_program_expressions,
     extract_ifelse_conditional_problem,
     extract_while_conditional_problem,
@@ -26,7 +26,7 @@ from core_lang_env.exec_code_v2 import (
 )
 from core_lang_env.parser import parse_code_str
 from core_lang_env.syntax_tree import BoolExprNode, FunctionCallAssignNode
-from searchers_utils import Problem
+from searchers.searchers_utils import Problem
 
 
 # ---------- Build an executed AnnotatedAST against a simple env ----------

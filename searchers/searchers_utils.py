@@ -96,7 +96,7 @@ class SimpleMapper:
             for inputs_tuple in product(*valid_objects_by_type):
                 self.queues[name].append(inputs_tuple)
     
-    def step(self, heuristic_cutoff='inf'):
+    def step(self, heuristic_cutoff=float('inf')):
         for func_name, queue in self.queues.items():
             if not queue:
                 continue
@@ -126,7 +126,7 @@ class SimpleMapper:
                     if (f_name,) + new_inputs not in self.visited_actions:
                         self.queues[f_name].append(new_inputs)
 
-    def search(self, max_steps=1000, heuristic_cutoff='inf'):
+    def search(self, max_steps=1000, heuristic_cutoff=float('inf')):
         for _ in range(max_steps):
             if all(len(q) == 0 for q in self.queues.values()):
                 break
@@ -135,142 +135,6 @@ class SimpleMapper:
             print("Target was discovered!")
         else:
             print("Target was NOT discovered.")
-
-class SimpleMapperV2:
-    def __init__(self, inp_types, inputs, target_type, target, functions, heuristic_distance: callable):
-        self.comp_map = ComputationalMap.init_empty_map()
-        self.target = target
-        self.target_type = target_type
-        self.heuristic_distance = heuristic_distance
-
-        # Store objects as raw values only
-        self.objects = set(inputs)
-
-        self.queues = {name: deque() for name in functions}
-        self.visited_actions = set()
-        self.target_found = False
-
-        # Register functions
-        for name, func in functions.items():
-            self.comp_map.add_function(name, func)
-
-        # Initialize queues
-        for name, func in functions.items():
-            valid_objects_by_type = [
-                [obj for obj in self.objects if isinstance(obj, t)]
-                for t in func.input_types
-            ]
-            for inputs_tuple in product(*valid_objects_by_type):
-                self.queues[name].append(inputs_tuple)
-
-    def step(self, heuristic_cutoff='inf'):
-        for func_name, queue in self.queues.items():
-            if not queue:
-                continue
-
-            inputs = queue.popleft()
-            if (func_name,) + inputs in self.visited_actions:
-                continue
-            self.visited_actions.add((func_name,) + inputs)
-
-            # Apply function
-            outputs = self.comp_map.act(func_name, inputs)
-
-            for out in outputs:
-                if not isinstance(out, self.target_type):
-                    self.objects.add(out)
-                    continue
-
-                if self.heuristic_distance(out, self.target) > heuristic_cutoff:
-                    continue
-
-                self.objects.add(out)
-
-                if out == self.target and not self.target_found:
-                    self.target_found = True
-                    print(f"*** Target found via {func_name}{inputs} = {out}")
-
-            # Queue new function applications
-            for f_name, f_obj in self.comp_map.functions.items():
-                valid_objects_by_type = [
-                    [obj for obj in self.objects if isinstance(obj, t)]
-                    for t in f_obj.input_types
-                ]
-                for new_inputs in product(*valid_objects_by_type):
-                    if (f_name,) + new_inputs not in self.visited_actions:
-                        self.queues[f_name].append(new_inputs)
-
-    def search(self, max_steps=1000, heuristic_cutoff='inf'):
-        for _ in range(max_steps):
-            if all(len(q) == 0 for q in self.queues.values()):
-                break
-            self.step(heuristic_cutoff)
-
-        if self.target_found:
-            print("Target was discovered!")
-        else:
-            print("Target was NOT discovered.")
-
-
-def extract_minimal_subgraph(comp_map, target_obj):
-    """
-    Extracts a minimal ComputationalMap that contains only
-    the objects and actions needed to compute `target_obj`.
-    
-    Args:
-        comp_map (ComputationalMap): The full computational graph.
-        target_obj (object): The object to trace back.
-    
-    Returns:
-        ComputationalMap: Minimal subgraph.
-    """
-    minimal_map = ComputationalMap.init_empty_map()
-
-    visited_objects = set()
-    visited_actions = set()
-    
-    def trace_back(obj_type, obj):
-        if (obj_type, obj) in visited_objects:
-            return
-        visited_objects.add((obj_type, obj))
-
-        # Add the object to the minimal map
-        if (obj_type, obj) not in minimal_map.objects:
-            minimal_map.objects[(obj_type, obj)] = set()
-
-        # If this object has no parent actions, it's an input
-        if (obj_type, obj) not in comp_map.objects or len(comp_map.objects[(obj_type, obj)]) == 0:
-            return
-
-        # Trace each parent action that produces this object
-        for action_key in comp_map.objects[(obj_type, obj)]:
-            if action_key in visited_actions:
-                continue
-            visited_actions.add(action_key)
-
-            # Add action to minimal map
-            func_name = action_key[0]
-            inputs = action_key[1:]
-
-            minimal_map.actions[action_key] = comp_map.actions[action_key]
-
-            # Ensure the function is registered
-            if func_name not in minimal_map.functions:
-                minimal_map.functions[func_name] = comp_map.functions[func_name]
-
-            # Connect outputs
-            for t, out in comp_map.actions[action_key]:
-                if (t, out) not in minimal_map.objects:
-                    minimal_map.objects[(t, out)] = set()
-                minimal_map.objects[(t, out)].add(action_key)
-
-            # Recursively trace inputs
-            for inp in inputs:
-                trace_back(type(inp), inp)
-
-    # Start tracing from the target
-    trace_back(type(target_obj), target_obj)
-    return minimal_map
 
 def extract_minimal_subgraph(comp_map, target_obj):
     minimal_map = ComputationalMap.init_empty_map()

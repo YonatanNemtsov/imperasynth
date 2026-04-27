@@ -5,7 +5,7 @@ pushes zero-or-more new ones. These tests freeze the stack-length deltas
 expected for each transition kind, plus the full sequences for if/else
 and while-loop construction.
 """
-from ast_searcher_v3 import (
+from searchers.ast_searcher_v3 import (
     AUG_END_ELSE,
     AUG_END_IF,
     AUG_END_WHILE,

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from core_lang_env.comp_env import *
 from core_lang_env.syntax_tree import *
 from core_lang_env.exec_code_v2 import *
-from searchers_utils import *
+from .searchers_utils import *
 from typing import Literal, Callable
 
 AugType = str

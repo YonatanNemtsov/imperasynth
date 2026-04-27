@@ -3,10 +3,8 @@
 `DataFlowGraph.from_ast` walks an AST and builds a graph where nodes are
 variables / function calls / direct assigns, and edges encode dependencies.
 """
-import pytest
-
 from core_lang_env.parser import parse_code_str
-from data_flow_graph import (
+from searchers.data_flow_graph import (
     DataFlowGraph,
     DataFlowGraphNodeDirectAssign,
     DataFlowGraphNodeFunctionCall,
@@ -70,17 +68,9 @@ def test_from_ast_direct_assign_creates_direct_assign_node():
     assert len(da_nodes) == 2
 
 
-@pytest.mark.xfail(
-    reason=(
-        "data_flow_graph._prosses_direct_assign requires target vars to already exist "
-        "in var_ids/nodes (KeyError otherwise). Fresh-target assignments like "
-        "`x3, x4 <- x2, x0` (which the orchestrator emits at end of if/else blocks) crash."
-    ),
-    strict=True,
-    raises=KeyError,
-)
 def test_from_ast_direct_assign_with_fresh_target_vars():
-    """End-of-else assignments often introduce fresh target variables."""
+    """End-of-else assignments often introduce fresh target variables;
+    DataFlowGraph creates new var nodes for them."""
     ast = parse_code_str("""
     {
         x2 = add(x0, x1);
@@ -88,7 +78,9 @@ def test_from_ast_direct_assign_with_fresh_target_vars():
         return x3;
     }
     """)
-    DataFlowGraph.from_ast(ast, {"x0": 0, "x1": 1})
+    graph = DataFlowGraph.from_ast(ast, {"x0": 0, "x1": 1})
+    da_nodes = [n for n in graph.nodes.values() if isinstance(n, DataFlowGraphNodeDirectAssign)]
+    assert len(da_nodes) == 2  # one assign per (target, source) pair
 
 
 def test_from_ast_descends_into_if_else_blocks():

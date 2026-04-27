@@ -21,6 +21,12 @@ class DataFlowGraphNodeVar(DataFlowGraphNode):
     def from_func_call(func_call_node: 'DataFlowGraphNodeFunctionCall', output_index: int):
         node_id = hash((func_call_node.func_name, func_call_node.node_id, output_index))
         return DataFlowGraphNodeVar(node_id)
+
+    @staticmethod
+    def from_assign_target(source_node: 'DataFlowGraphNodeVar', target_name: str):
+        """Fresh var node introduced as a DirectAssign target (e.g. `x3, x4 <- x2, x0`)."""
+        node_id = hash(('assign_target', source_node.node_id, target_name))
+        return DataFlowGraphNodeVar(node_id)
     
     def __repr__(self):
         return f'DataFlowGraphNodeVar(node_id={self.node_id%1000}...)'
@@ -91,8 +97,18 @@ class DataFlowGraph:
     @staticmethod
     def _prosses_direct_assign(nodes, graph, var_ids, stmt: DirectAssignNode):
         sources = [nodes[var_ids[arg]] for arg in stmt.source_vars]
-        targets = [nodes[var_ids[arg]] for arg in stmt.target_vars]
-        
+
+        targets = []
+        for target_name, source in zip(stmt.target_vars, sources):
+            if target_name in var_ids:
+                targets.append(nodes[var_ids[target_name]])
+            else:
+                fresh = DataFlowGraphNodeVar.from_assign_target(source, target_name)
+                var_ids[target_name] = fresh.node_id
+                nodes[fresh.node_id] = fresh
+                graph[fresh.node_id] = []
+                targets.append(fresh)
+
         for t, s in zip(targets, sources):
             new_direct_assign_node = DataFlowGraphNodeDirectAssign.from_source_and_target(t, s)
             nodes[new_direct_assign_node.node_id] = new_direct_assign_node

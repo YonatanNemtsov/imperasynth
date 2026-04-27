@@ -8,7 +8,7 @@ Note: the while-loop construction path is currently incomplete in the orchestrat
 solutions only need func calls + if/else, which is the path that does work.
 """
 from core_lang_env.comp_env import BoolFunction, Function
-from search_orchestrator import (
+from searchers.search_orchestrator import (
     EndElseCandidate,
     EndIfCandidate,
     FuncCallCandidate,
@@ -18,7 +18,7 @@ from search_orchestrator import (
     StartIfCandidate,
     generate_augmentation_requests_from_state,
 )
-from searchers_utils import Problem
+from searchers.searchers_utils import Problem
 
 
 def _max_of_two_problem():

@@ -4,7 +4,7 @@ Each entry returns (problem, known_funcs, known_bools, expected_difficulty_hint)
 Add new ones here so all benchmarks share a canonical set.
 """
 from core_lang_env.comp_env import BoolFunction, Function
-from searchers_utils import Problem
+from searchers.searchers_utils import Problem
 
 
 def _int_bools():

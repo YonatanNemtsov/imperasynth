@@ -4,7 +4,7 @@ Each `apply_augmentation_*_group` builds a small AST step-by-step. These tests
 freeze the structural shape of the resulting AST after each mutation, plus the
 parser-formatter round-trip that nothing semantic was lost.
 """
-from ast_searcher_v3 import (
+from searchers.ast_searcher_v3 import (
     AnnotatedAstGroup,
     NO_ACTION,
     apply_augmentation_end_else_group,

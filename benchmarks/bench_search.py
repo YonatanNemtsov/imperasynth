@@ -18,7 +18,7 @@ import time
 # Make sibling modules importable when run as a script.
 sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
-from search_orchestrator import SearchOrchestrator
+from searchers.search_orchestrator import SearchOrchestrator
 
 from benchmarks.problems import ALL
 

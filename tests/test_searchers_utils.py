@@ -21,7 +21,7 @@ from core_lang_env.exec_code_v2 import (
     execute_step_with_annotation,
 )
 from core_lang_env.parser import parse_code_str
-from searchers_utils import (
+from searchers.searchers_utils import (
     SimpleMapper,
     compute_block_hash,
     compute_func_call_hash,
@@ -138,14 +138,10 @@ def test_get_variables_defined_in_block():
 # ---------- Heuristic distance over a comp_map ----------
 
 def _make_comp_map_for_target(inp_types, inputs, target_type, target, funcs):
-    """Build a ComputationalMap by running SimpleMapper to reach target.
-
-    Note: SimpleMapper.search has a buggy default `heuristic_cutoff='inf'` (a string),
-    so every caller must pass `float('inf')` explicitly to disable pruning.
-    """
+    """Build a ComputationalMap by running SimpleMapper to reach target."""
     hdist = lambda a, b: abs(a - b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else 0
     mapper = SimpleMapper(inp_types, inputs, target_type, target, funcs, hdist)
-    mapper.search(max_steps=200, heuristic_cutoff=float("inf"))
+    mapper.search(max_steps=200)
     return extract_minimal_subgraph(mapper.comp_map, target)
 
 

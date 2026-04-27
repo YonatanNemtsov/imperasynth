@@ -4,8 +4,6 @@ Strong assertion: parsing the formatted output of an AST yields an AST equal
 to the original. This catches regressions in either direction without needing
 to compare exact strings.
 """
-import pytest
-
 from core_lang_env.parser import ast_to_code_str, parse_code_str
 
 
@@ -78,14 +76,6 @@ def test_round_trip_nested_while_if_with_assign():
     """)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Parser/formatter inconsistency: grammar accepts `x1 = zero()` (no semicolon) "
-        "for zero-arg calls, but ast_to_code_str always emits a trailing semicolon, "
-        "so the formatted output can't be reparsed."
-    ),
-    strict=True,
-)
 def test_round_trip_zero_arg_function():
     _round_trip_equal("""
     {

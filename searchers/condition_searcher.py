@@ -2,7 +2,7 @@ from core_lang_env.comp_env import *
 from core_lang_env.exec_code_v2 import *
 from core_lang_env.parser import *
 from core_lang_env.syntax_tree import *
-from searchers_utils import *
+from .searchers_utils import *
 
 """ Search boolean traces """
 

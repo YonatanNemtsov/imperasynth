@@ -1,4 +1,4 @@
-from .syntax_tree import ASTNode, BoolExprNode, WhileNode, IfNode, BlockNode, FunctionCallAssignNode, ReturnNode, ElseNode, IfElseNode, DirectAssignNode, RepeatNode
+from .syntax_tree import ASTNode, BoolExprNode, WhileNode, BlockNode, FunctionCallAssignNode, ReturnNode, IfElseNode, DirectAssignNode, RepeatNode
 
 from lark import Lark, Tree, Token
 
@@ -26,7 +26,7 @@ grammar = """
     repeat_statement: "repeat" "(" INT ")" block
 
     return_statement: "return" [var_list] ";"
-    function_call_assign: var_list "=" func_name "(" arg_list ")" ";" | var_list "=" func_name "()"
+    function_call_assign: var_list "=" func_name "(" arg_list ")" ";" | var_list "=" func_name "()" ";"
     var_list: CNAME ("," CNAME)*
     arg_list: CNAME ("," CNAME)*
 
@@ -99,7 +99,8 @@ def translate_to_custom_ast(tree):
     elif tree.data == "function_call_assign":
         var_names = translate_to_custom_ast(tree.children[0])
         func_name = translate_to_custom_ast(tree.children[1])
-        arg_names = translate_to_custom_ast(tree.children[2])
+        # Zero-arg form (no arg_list child) → empty arg tuple.
+        arg_names = translate_to_custom_ast(tree.children[2]) if len(tree.children) > 2 else ()
         return FunctionCallAssignNode(var_names, func_name, arg_names)
 
     elif tree.data == "bool_expr":

@@ -4,11 +4,11 @@ from typing import Tuple
 
 from core_lang_env.comp_env import *
 from core_lang_env.syntax_tree import *
-from searchers_utils import *
+from .searchers_utils import *
 
-import trace_searcher as tsr
-import condition_searcher as csr
-import ast_searcher_v3 as asr
+from . import trace_searcher as tsr
+from . import condition_searcher as csr
+from . import ast_searcher_v3 as asr
 
 
 @dataclass(slots=True)
