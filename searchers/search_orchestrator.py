@@ -924,16 +924,85 @@ class SearchOrchestrator:
         traverse(search_state.ast_group.ast, ())
         return positions
 
+    def get_while_positions(self, search_state: SearchState) -> list[ASTNodePosition]:
+        positions = []
+        def traverse(node, pos):
+            if isinstance(node, WhileNode):
+                positions.append(pos)
+            for i, child in enumerate(node.children):
+                traverse(child, pos + (i,))
+
+        traverse(search_state.ast_group.ast, ())
+        return positions
+
+    def search_boolean_expression_while_node(self, search_state: SearchState, node_position: ASTNodePosition, max_depth=20):
+        bool_problem, input_vars = csr.extract_while_conditional_problem_for_group(
+            search_state.ast_group.ast,
+            node_position,
+            search_state.trace_group.traces,
+            self.known_funcs,
+            search_state.initial_vars,
+        )
+        if bool_problem is None or not bool_problem.instances:
+            return None
+        bool_trace_solution = csr.search_boolean_traces(bool_problem, self.known_bools, max_depth)
+        if any(t.solution_object_id is None for t in bool_trace_solution):
+            return None
+        return csr.create_bool_program_expressions(bool_trace_solution[0], input_vars)
+
+    def integrate_boolean_expression_while_node(self, ast: BlockNode, while_node_position: ASTNodePosition, boolean_expression_statements: list[ASTNode]):
+        """Splice a learned bool expression into a WhileNode's condition slot.
+
+        The last statement is the BoolExprNode (becomes the while's condition).
+        Preceding statements are helper FuncCalls that compute the condition's
+        inputs. They must run BOTH before the while (for the initial check)
+        AND at the end of the body (so subsequent iteration checks see updated
+        values when loop variables change). Without the body-end copy the
+        condition would be evaluated once and never refresh — infinite loop.
+        """
+        full_ast = ast.copy()
+        bool_expr = boolean_expression_statements[-1]
+        helpers = boolean_expression_statements[:-1]
+
+        # Replace WhileNode's bool_expr (child index 0).
+        full_ast.replace_node(while_node_position + (0,), bool_expr)
+
+        # Insert helpers BEFORE the while (initial check).
+        for stmt in reversed(helpers):
+            full_ast.insert_node(while_node_position, stmt)
+
+        # Insert COPIES of helpers at END of the (now repositioned) while's body.
+        # The while-node position has shifted by len(helpers) due to inserts above.
+        new_while_pos = while_node_position[:-1] + (while_node_position[-1] + len(helpers),)
+        new_while_node = full_ast.get_node_at_position(new_while_pos)
+        for stmt in helpers:
+            new_while_node.block.statements.append(stmt.copy())
+
+        return full_ast
 
     def search_boolean_expressions(self, search_state: SearchState):
-        ifelse_positions = self.get_ifelse_positions(search_state)
         full_ast = search_state.ast_group.ast.copy()
-        for pos in reversed(ifelse_positions):
-            boolean_expression_statements = self.search_boolean_expression_ifelse_node(search_state, pos)
-            if not boolean_expression_statements:
-                print('bool expr not found')
+
+        # Fill if/else conditions first.
+        for pos in reversed(self.get_ifelse_positions(search_state)):
+            stmts = self.search_boolean_expression_ifelse_node(search_state, pos)
+            if not stmts:
+                print('bool expr not found (if/else)')
                 return None
-            full_ast = self.integrate_boolean_expression_ifelse_node(full_ast, pos, boolean_expression_statements)
+            full_ast = self.integrate_boolean_expression_ifelse_node(full_ast, pos, stmts)
+
+        # Then while conditions. Position resolution uses the AST as it stood
+        # before the if/else fills (positions in `search_state.ast_group.ast`),
+        # and integrates back into the modified `full_ast`. Both share the same
+        # while-node positions because if/else integration only replaces
+        # bool_expr children at index 0, not statement-level structure.
+        for pos in reversed(self.get_while_positions(search_state)):
+            stmts = self.search_boolean_expression_while_node(search_state, pos)
+            if not stmts:
+                print('bool expr not found (while)')
+                return None
+            full_ast = self.integrate_boolean_expression_while_node(full_ast, pos, stmts)
+
         return full_ast
 
 

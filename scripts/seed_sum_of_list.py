@@ -50,6 +50,7 @@ def build_sum_of_list_problem():
     }
     bools = {
         "is_empty": BoolFunction(lambda lst: ((len(lst) == 0,)), [tuple], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
     }
     problem = Problem(
         (tuple,), (int,),
@@ -323,6 +324,10 @@ def main():
         sols = [t.objects[t.solution_object_id].value if t.solution_object_id is not None else None
                 for t in sk.trace_group.traces]
         print(f"trace solutions: {sols}")
+        print()
+    for i, prog in enumerate(orch.completed_programs[:3]):
+        print(f"--- completed program {i} (with learned bool conditions) ---")
+        print(ast_to_code_str(prog))
         print()
 
 

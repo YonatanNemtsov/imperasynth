@@ -186,6 +186,126 @@ def extract_while_conditional_problem(annotated_ast: AnnotatedAST, while_node_po
     return InterDependentProblemGroup(problem_group), var_names
 
 
+def _simulate_block_until(block: BlockNode, target_idx: int, sim_values: dict, known_funcs: dict) -> bool:
+    """Simulate `block.statements[0..target_idx-1]` in place on sim_values.
+    Returns True on success, False if any statement fails (KeyError or wrong
+    output count). Only handles FunctionCallAssign and DirectAssign for now —
+    if/else and nested while at top level pre-loop aren't supported here.
+    """
+    for stmt in block.statements[:target_idx]:
+        if isinstance(stmt, FunctionCallAssignNode):
+            try:
+                input_vals = tuple(sim_values[arg] for arg in stmt.arg_names)
+            except KeyError:
+                return False
+            func = known_funcs.get(stmt.func_name)
+            if func is None:
+                return False
+            try:
+                outs = func.func(*input_vals)
+            except Exception:
+                return False
+            if not isinstance(outs, (tuple, list)):
+                outs = (outs,)
+            if len(outs) != len(stmt.var_names):
+                return False
+            for v, o in zip(stmt.var_names, outs):
+                sim_values[v] = o
+        elif isinstance(stmt, DirectAssignNode):
+            try:
+                src_vals = [sim_values[s] for s in stmt.source_vars]
+            except KeyError:
+                return False
+            for s in stmt.source_vars:
+                sim_values.pop(s, None)
+            for t, v in zip(stmt.target_vars, src_vals):
+                sim_values[t] = v
+        else:
+            return False  # bail on other top-level constructs for now
+    return True
+
+
+def _simulate_while_iterations(body: BlockNode, sim_values: dict, known_funcs: dict, max_iters: int = 1000):
+    """Run the while body iteration by iteration on sim_values, recording each
+    iteration's pre-iteration state as an "entry". Stop when the body fails
+    to run (would crash on next iteration); record that failure-triggering
+    state as the "skip". Returns (entries, skip) — the skip is the var_state
+    when the loop should exit, or None if the simulation didn't terminate.
+    """
+    entries = []
+    for _ in range(max_iters):
+        before = dict(sim_values)
+        # Run a copy of body on sim_values; if it fails, this iteration is the skip.
+        trial = dict(sim_values)
+        ok = _simulate_block_until(body, len(body.statements), trial, known_funcs)
+        if not ok:
+            return entries, before  # body would fail → exit before this iteration
+        entries.append(before)
+        sim_values.clear()
+        sim_values.update(trial)
+    return entries, None  # didn't terminate within max_iters
+
+
+def extract_while_conditional_problem_for_group(
+    ast: BlockNode,
+    while_node_position: ASTNodePosition,
+    traces: list[SimpleCompEnv],
+    known_funcs: dict,
+    input_var_states: list[dict[str, "ObjId"]],
+) -> tuple[Problem | None, list[str]]:
+    """Build a flat boolean-learning Problem for a while loop's condition by
+    simulating the program forward for each trace from its initial inputs.
+
+    Walks the top-level block up to the while loop, then iterates the body
+    until it would fail. Each iteration's pre-iteration variable state is a
+    True instance; the failure-triggering state is the False instance.
+
+    Differs from `extract_while_conditional_problem`: doesn't read the
+    AnnotatedAST (which is frozen at build phase) — the simulation gives us
+    accurate execute-phase iteration data.
+    """
+    while_node = ast.get_node_at_position(while_node_position)
+    if not isinstance(while_node, WhileNode):
+        raise TypeError("Node at position is not a WhileNode")
+
+    # Only top-level while loops handled here — extend later for nested.
+    if len(while_node_position) != 1:
+        return None, []
+
+    while_idx = while_node_position[0]
+    body = while_node.block
+
+    all_entries: list[dict] = []
+    all_skips: list[dict] = []
+
+    for trace, init_state in zip(traces, input_var_states):
+        sim_values = {k: trace.objects[v].value for k, v in init_state.items()}
+        if not _simulate_block_until(ast, while_idx, sim_values, known_funcs):
+            continue
+        entries, skip = _simulate_while_iterations(body, sim_values, known_funcs)
+        all_entries.extend(entries)
+        if skip is not None:
+            all_skips.append(skip)
+
+    if not all_entries and not all_skips:
+        return None, []
+
+    # Variable names: intersection of keys present in every entry/skip state.
+    all_states = all_entries + all_skips
+    var_names = sorted(set.intersection(*(set(s.keys()) for s in all_states)))
+    if not var_names:
+        return None, []
+
+    instances = {}
+    idx = 0
+    for state, label in [(s, True) for s in all_entries] + [(s, False) for s in all_skips]:
+        inputs = tuple(state[v] for v in var_names)
+        instances[idx] = (inputs, (label,))
+        idx += 1
+
+    sample_inputs, _ = next(iter(instances.values()))
+    input_types = tuple(type(x) for x in sample_inputs)
+    return Problem(input_types, bool, instances), var_names
 
 
 

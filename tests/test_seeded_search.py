@@ -42,6 +42,7 @@ def _sum_of_list_problem():
     }
     bools = {
         "is_empty": BoolFunction(lambda lst: ((len(lst) == 0,)), [tuple], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
     }
     problem = Problem(
         (tuple,), (int,),
@@ -154,6 +155,64 @@ def test_seeded_sum_of_list_search_finds_while_skeleton():
         target = problem.instances[i][1][0]
         actual = trace.objects[trace.solution_object_id].value
         assert actual == target, f"trace {i}: returned {actual}, expected {target}"
+
+
+def test_seeded_sum_of_list_phase3_fills_in_while_condition():
+    """Phase 3: extract_while_conditional_problem_for_group + integrate_while
+    fills in the TBD condition with a learned bool expression. Verify the
+    completed program actually executes correctly on training inputs AND on
+    inputs not seen during training (generalization)."""
+    from core_lang_env.comp_env import CompObject, SimpleCompEnv
+    from core_lang_env.exec_code_v2 import (
+        ExecutionContext, ExecutionPositionV2, execute_step,
+    )
+
+    problem, funcs, bools = _sum_of_list_problem()
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        orch = SearchOrchestrator.create_new_orchestrator_from_problem(
+            problem, funcs, bools, _hdist, 50, map_size=50, enable_while_loops=True
+        )
+    orch.search_queue = PriorityQueue()
+    orch.tie_counter = 0
+    orch.visited_states = set()
+    orch.enqueue(_build_seed_state(problem, funcs))
+
+    for _ in range(200):
+        if orch.search_queue.empty() or orch.completed_programs:
+            break
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.step(trace_length_limit=20, max_ast_len=30)
+
+    assert orch.completed_programs, "Phase 3 did not produce a completed program"
+    program = orch.completed_programs[0]
+
+    # The completed AST must NOT contain TBD_CONDITIONAL anywhere.
+    code = repr(program)
+    assert "TBD_CONDITIONAL" not in code, "completed program still has TBD condition"
+
+    # Execute the synthesized program on training + held-out inputs.
+    def run_on(lst):
+        env = SimpleCompEnv()
+        env.add_input_object(CompObject(tuple, lst))
+        for name, f in funcs.items():
+            env.add_function(name, f)
+        for name, f in bools.items():
+            env.add_function(name, f)
+        ctx = ExecutionContext(program, ExecutionPositionV2.start_position(), env, {"x0": 0}, False)
+        for _ in range(1000):
+            if ctx.completed:
+                break
+            execute_step(ctx)
+        return env.objects[env.solution_object_id].value if env.solution_object_id is not None else None
+
+    # Training instances.
+    assert run_on((1,)) == 1
+    assert run_on((1, 2)) == 3
+    # Generalization: empty list and longer lists.
+    assert run_on(()) == 0
+    assert run_on((1, 2, 3, 4, 5)) == 15
+    assert run_on((10, 20, 30)) == 60
 
 
 def test_simple_comp_env_copy_does_not_share_action_history_short():
