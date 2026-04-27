@@ -59,7 +59,32 @@ def double_or_diff():
     return problem, funcs, _int_bools()
 
 
+def sum_of_list():
+    """Sum the elements of a list. Genuinely needs a while loop — variable
+    iteration count per trace can't be expressed without one (or repeated
+    if/else of arbitrary depth)."""
+    funcs = {
+        "add": Function(lambda x, y: (x + y,), [int, int], [int]),
+        "get_head": Function(lambda lst: ((lst[0],) if lst else ()), [tuple], [int]),
+        "get_tail": Function(lambda lst: ((lst[1:],) if lst else ((),)), [tuple], [tuple]),
+        "zero": Function(lambda: (0,), [], [int]),
+    }
+    bools = {
+        "is_empty": BoolFunction(lambda lst: ((len(lst) == 0,)), [tuple], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
+    }
+    problem = Problem(
+        (tuple,), (int,),
+        instances={
+            0: (((1,),), (1,)),       # 1 iter
+            1: (((1, 2),), (3,)),     # 2 iters
+        },
+    )
+    return problem, funcs, bools
+
+
 ALL = {
     "max_of_two": max_of_two,
     "double_or_diff": double_or_diff,
+    "sum_of_list": sum_of_list,
 }
