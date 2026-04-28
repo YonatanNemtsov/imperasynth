@@ -608,12 +608,36 @@ def generate_execute_func_call_candidates(state: SearchState, request: 'Augmenta
     return [ExecuteFuncCallCandidate(request.exec_position, tuple(sorted(request.group_indices)))]
 
 
-def generate_execute_if_else_candidates(state: SearchState, request: 'AugmentationRequestExecuteIfElse', cmaps: list[ComputationalMap]) -> list['ExecuteIfElseCandidate']:
-    # Use the execute-phase enumerator (allows ∅ and full set), NOT the
-    # start_if one (which excludes both — only correct for build phase).
+def generate_execute_if_else_candidates(
+    state: SearchState,
+    request: 'AugmentationRequestExecuteIfElse',
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list['ExecuteIfElseCandidate']:
+    """Per-iteration if/else split. If `realizable_fn` is provided, only
+    enumerate partitions that some bool expression of depth ≤ max_depth
+    could realize on the active traces' in-scope values — every other
+    subset would be rejected by Phase 3 anyway."""
+    group_indices = request.group_indices
+    if realizable_fn is None:
+        return [
+            ExecuteIfElseCandidate(request.exec_position, tuple(sorted(if_indices)), tuple(sorted(group_indices)))
+            for if_indices in tsr.find_possible_execute_if_else_actions(group_indices)
+        ]
+
+    active = sorted(group_indices)
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
+    ]
+    partitions = realizable_fn(in_scope, max_depth)
+    # Map local trace indices (positions in `active`) back to global indices.
+    if_index_sets = {frozenset(active[i] for i in local) for local in partitions}
     return [
-        ExecuteIfElseCandidate(request.exec_position, tuple(sorted(if_indices)), tuple(sorted(request.group_indices)))
-        for if_indices in tsr.find_possible_execute_if_else_actions(request.group_indices)
+        ExecuteIfElseCandidate(request.exec_position, tuple(sorted(s)), tuple(sorted(group_indices)))
+        for s in if_index_sets
     ]
 
 
@@ -767,11 +791,27 @@ class SearchOrchestrator:
         self.visited_states = set()
         self.tie_counter = 0
         self.last_processed_state = None
+        # Cache: (canonical per-trace values, max_depth) → {True-set: realizing stmts}.
+        self._partition_cache: dict = {}
 
 
         # store completed programs (states with concluded search)
         self.program_skeleton_candidates: list[SearchState] = []
         self.completed_programs: list[SearchState] = []
+
+    def realizable_partitions(self, in_scope_values_per_trace: list[dict], max_depth: int) -> dict:
+        """Cached enumerate_realizable_partitions. Key uses canonical per-trace
+        (sorted name, value) tuples — same in-scope state across different
+        search states / paths gets the cached result."""
+        key = (
+            tuple(tuple(sorted(d.items())) for d in in_scope_values_per_trace),
+            max_depth,
+        )
+        if key not in self._partition_cache:
+            self._partition_cache[key] = csr.enumerate_realizable_partitions(
+                in_scope_values_per_trace, self.known_funcs, self.known_bools, max_depth
+            )
+        return self._partition_cache[key]
 
     # -----------------------------------------------------------------
     @staticmethod
@@ -849,7 +889,7 @@ class SearchOrchestrator:
             elif isinstance(req, AugmentationRequestExecuteFuncCall):
                 candidates = generate_execute_func_call_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestExecuteIfElse):
-                candidates = generate_execute_if_else_candidates(state, req, self.cmaps)
+                candidates = generate_execute_if_else_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestExecuteDirectAssign):
                 candidates = generate_execute_direct_assign_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestReturn):
