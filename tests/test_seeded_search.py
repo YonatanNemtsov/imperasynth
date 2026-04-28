@@ -20,10 +20,13 @@ from queue import PriorityQueue
 from core_lang_env.comp_env import BoolFunction, Function
 from core_lang_env.syntax_tree import WhileNode
 from searchers.search_orchestrator import (
+    EndElseCandidate,
+    EndIfCandidate,
     EndWhileCandidate,
     FuncCallCandidate,
     SearchOrchestrator,
     SearchState,
+    StartIfCandidate,
     StartWhileCandidate,
 )
 from searchers.searchers_utils import Problem
@@ -213,6 +216,160 @@ def test_seeded_sum_of_list_phase3_fills_in_while_condition():
     assert run_on(()) == 0
     assert run_on((1, 2, 3, 4, 5)) == 15
     assert run_on((10, 20, 30)) == 60
+
+
+def _sum_of_evens_problem():
+    funcs = {
+        "add": Function(lambda x, y: (x + y,), [int, int], [int]),
+        "get_head": Function(lambda lst: ((lst[0],) if lst else ()), [tuple], [int]),
+        "get_tail": Function(lambda lst: ((lst[1:],) if lst else ((),)), [tuple], [tuple]),
+        "zero": Function(lambda: (0,), [], [int]),
+        "identity": Function(lambda x: (x,), [int], [int]),
+    }
+    bools = {
+        "is_empty": BoolFunction(lambda lst: ((len(lst) == 0,)), [tuple], [bool]),
+        "is_even": BoolFunction(lambda x: (x % 2 == 0,), [int], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
+    }
+    problem = Problem(
+        (tuple,), (int,),
+        instances={
+            0: (((2,),), (2,)),       # one even
+            1: (((1,),), (0,)),       # one odd
+            2: (((1, 2),), (2,)),     # mix, len 2
+            3: (((2, 3, 4),), (6,)),  # mix, len 3
+        },
+    )
+    return problem, funcs, bools
+
+
+def _build_sum_of_evens_seed(problem, funcs):
+    """Hand-build the full sum-of-evens skeleton:
+        x1 = zero();
+        while (TBD) {
+            x2 = get_head(x0);
+            x3 = get_tail(x0);
+            if (TBD) { x4 = add(x1, x2); }
+            else     { x5 = identity(x1); x4 <- x5; }
+            x0, x1 <- x3, x4;
+        }
+    Build phase complete; executing_while_frontier on top.
+    """
+    state = SearchState.init_new_search_state_from_problem_and_funcs(problem, funcs)
+    n = len(state.trace_group.traces)
+    all_idx = tuple(range(n))
+
+    def fc(s, var_action):
+        func_name, arg_names = var_action
+        sa = tuple(
+            (func_name, tuple(s.variable_states[i][a] for a in arg_names))
+            for i in range(n)
+        )
+        return s.apply_func_call_candidate(FuncCallCandidate(
+            s.aug_stack.peek()[0], all_idx, var_action, sa, 1,
+        ))
+
+    state = fc(state, ("zero", ()))
+    state = state.apply_start_while_candidate(StartWhileCandidate(
+        state.aug_stack.peek()[0], all_idx,
+    ))
+    state = fc(state, ("get_head", ("x0",)))
+    state = fc(state, ("get_tail", ("x0",)))
+
+    # Iter-1 split by is_even(head).
+    if_idx = tuple(i for i in range(n) if problem.instances[i][0][0][0] % 2 == 0)
+    else_idx = tuple(i for i in range(n) if i not in if_idx)
+    state = state.apply_start_if_candidate(StartIfCandidate(
+        state.aug_stack.peek()[0], if_idx, else_idx,
+    ))
+
+    # if-branch: x4 = add(x1, x2)
+    sa = tuple(
+        ("add", (state.variable_states[i]["x1"], state.variable_states[i]["x2"]))
+        if i in if_idx else "NO_ACTION"
+        for i in range(n)
+    )
+    state = state.apply_func_call_candidate(FuncCallCandidate(
+        state.aug_stack.peek()[0], if_idx, ("add", ("x1", "x2")), sa, 1,
+    ))
+    state = state.apply_end_if_candidate(EndIfCandidate(group_indices=if_idx))
+
+    # else-branch: x5 = identity(x1)
+    sa = tuple(
+        ("identity", (state.variable_states[i]["x1"],))
+        if i in else_idx else "NO_ACTION"
+        for i in range(n)
+    )
+    state = state.apply_func_call_candidate(FuncCallCandidate(
+        state.aug_stack.peek()[0], else_idx, ("identity", ("x1",)), sa, 1,
+    ))
+    state = state.apply_end_else_candidate(EndElseCandidate(
+        state.aug_stack.peek()[0], else_idx,
+        target_vars=("x4",), source_vars=("x5",),
+    ))
+
+    state = state.apply_end_while_candidate(EndWhileCandidate(
+        state.aug_stack.peek()[0], all_idx,
+        target_vars=("x0", "x1"), source_vars=("x3", "x4"),
+    ))
+    return state
+
+
+def test_seeded_sum_of_evens_phase3_completes_correctly():
+    """Sum-of-evens has a while loop with an if/else inside its body. This
+    exercises three pieces simultaneously: (1) the body-validity simulator
+    handling vars defined by end_else, (2) Phase 3's while-condition
+    extractor simulating IfElseNode children correctly, (3) the if/else
+    Phase 3 fill being threaded through to the while-condition stage."""
+    from core_lang_env.comp_env import CompObject, SimpleCompEnv
+    from core_lang_env.exec_code_v2 import (
+        ExecutionContext, ExecutionPositionV2, execute_step,
+    )
+
+    problem, funcs, bools = _sum_of_evens_problem()
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        orch = SearchOrchestrator.create_new_orchestrator_from_problem(
+            problem, funcs, bools, _hdist, 50, map_size=50, enable_while_loops=True
+        )
+    orch.search_queue = PriorityQueue()
+    orch.tie_counter = 0
+    orch.visited_states = set()
+    orch.enqueue(_build_sum_of_evens_seed(problem, funcs))
+
+    for _ in range(500):
+        if orch.search_queue.empty() or orch.completed_programs:
+            break
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.step(trace_length_limit=30, max_ast_len=40)
+
+    assert orch.completed_programs, "Phase 3 did not produce a completed program"
+    program = orch.completed_programs[0]
+    assert "TBD_CONDITIONAL" not in repr(program), "completed program still has TBD condition"
+
+    def run_on(lst):
+        env = SimpleCompEnv()
+        env.add_input_object(CompObject(tuple, lst))
+        for name, f in {**funcs, **bools}.items():
+            env.add_function(name, f)
+        ctx = ExecutionContext(program, ExecutionPositionV2.start_position(), env, {"x0": 0}, False)
+        for _ in range(1000):
+            if ctx.completed:
+                break
+            execute_step(ctx)
+        return env.objects[env.solution_object_id].value if env.solution_object_id is not None else None
+
+    # Training instances.
+    assert run_on((2,)) == 2
+    assert run_on((1,)) == 0
+    assert run_on((1, 2)) == 2
+    assert run_on((2, 3, 4)) == 6
+    # Generalization: empty list, all-odd, all-even, longer mixes.
+    assert run_on(()) == 0
+    assert run_on((1, 3, 5)) == 0
+    assert run_on((2, 4, 6)) == 12
+    assert run_on((1, 2, 3, 4, 5, 6)) == 12
+    assert run_on((7, 8, 9, 10)) == 18
 
 
 def test_simple_comp_env_copy_does_not_share_action_history_short():
