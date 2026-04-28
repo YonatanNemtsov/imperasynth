@@ -535,11 +535,39 @@ def generate_end_if_candidates(state: SearchState, request: AugmentationRequestE
     return [EndIfCandidate(request.group_indices)]
 
 
-def generate_start_while_candidates(state: SearchState, request: 'AugmentationRequestStartWhile', cmaps: list[ComputationalMap]) -> list['StartWhileCandidate']:
-    return [
-        StartWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
-        for while_indices in tsr.find_possible_start_while_actions(request.group_indices)
+def generate_start_while_candidates(
+    state: SearchState,
+    request: 'AugmentationRequestStartWhile',
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list['StartWhileCandidate']:
+    """Build-phase: which traces enter the loop at least once. The (still-TBD)
+    while condition will be evaluated pre-loop; entering traces are those
+    where it returns True. With realizable_fn, restricts to True-sets some
+    bool expression of depth ≤ max_depth can realize. Empty subset is dropped
+    (no traces entering = no while loop)."""
+    group_indices = request.group_indices
+    if realizable_fn is None:
+        return [
+            StartWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
+            for while_indices in tsr.find_possible_start_while_actions(group_indices)
+        ]
+
+    active = sorted(group_indices)
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
     ]
+    partitions = realizable_fn(in_scope, max_depth)
+    candidates = []
+    for local in partitions:
+        if not local:
+            continue  # empty subset = no traces enter = no while loop
+        while_indices = tuple(sorted(active[i] for i in local))
+        candidates.append(StartWhileCandidate(request.exec_position, while_indices))
+    return candidates
 
 
 def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequestEndWhile', cmaps: list[ComputationalMap]) -> list['EndWhileCandidate']:
@@ -609,19 +637,44 @@ def _can_trace_execute_while_body(state: SearchState, trace_idx: int, body: Bloc
     return True
 
 
-def generate_enter_while_candidates(state: SearchState, request: 'AugmentationRequestEnterWhile', cmaps: list[ComputationalMap]) -> list['EnterWhileCandidate']:
-    """Enumerate which traces take this iteration, but only over the subset of
-    traces whose loop body would actually execute successfully on their current
-    variable state. Traces that can't (e.g. empty-list trace + get_head body)
-    are excluded — the search would otherwise crash on KeyError downstream."""
+def generate_enter_while_candidates(
+    state: SearchState,
+    request: 'AugmentationRequestEnterWhile',
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list['EnterWhileCandidate']:
+    """Execute-phase: which traces take another iteration. Two filters apply:
+    (1) the body has to actually execute on the trace's current state (e.g.
+    head-of-empty-list would crash); (2) with realizable_fn, the True-set
+    has to match some bool expression on the active traces' in-scope values
+    — Phase 3 will pick that very expression as the while condition."""
     while_node = state.ast_group.ast.get_node_at_position(request.exec_position[0])
     body = while_node.block
     valid = {i for i in request.group_indices
              if _can_trace_execute_while_body(state, i, body)}
-    return [
-        EnterWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
-        for while_indices in tsr.find_possible_start_while_actions(valid)
+    if realizable_fn is None:
+        return [
+            EnterWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
+            for while_indices in tsr.find_possible_start_while_actions(valid)
+        ]
+
+    active = sorted(valid)
+    if not active:
+        return []
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
     ]
+    partitions = realizable_fn(in_scope, max_depth)
+    candidates = []
+    for local in partitions:
+        if not local:
+            continue
+        while_indices = tuple(sorted(active[i] for i in local))
+        candidates.append(EnterWhileCandidate(request.exec_position, while_indices))
+    return candidates
 
 
 def generate_skip_while_candidates(state: SearchState, request: 'AugmentationRequestSkipWhile', cmaps: list[ComputationalMap]) -> list['SkipWhileCandidate']:
@@ -911,11 +964,11 @@ class SearchOrchestrator:
             elif isinstance(req, AugmentationRequestEndElse):
                 candidates = generate_end_else_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestStartWhile):
-                candidates = generate_start_while_candidates(state, req, self.cmaps)
+                candidates = generate_start_while_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestEndWhile):
                 candidates = generate_end_while_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestEnterWhile):
-                candidates = generate_enter_while_candidates(state, req, self.cmaps)
+                candidates = generate_enter_while_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestSkipWhile):
                 candidates = generate_skip_while_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestExecuteBlock):
