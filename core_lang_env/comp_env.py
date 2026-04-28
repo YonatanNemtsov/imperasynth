@@ -176,23 +176,16 @@ class SimpleCompEnv:
 
     
     def copy(self):
-        """Returns a deep copy of the environment"""
+        """Shallow copy of the environment — every mutable container is copied
+        so that subsequent mutations on the new env don't leak back into self."""
         new_env = SimpleCompEnv(self.known_functions.copy())
-        
-        # Copy all objects
-        #for obj_id, obj in self.objects.items():
-        #    new_obj = obj.copy()
-        #    new_obj.id = obj_id
-        #    new_env.objects[obj_id] = new_obj
-        
         new_env.objects = self.objects.copy()
-        
-        # Copy other attributes
         new_env.input_objects = self.input_objects.copy()
         new_env.action_history = self.action_history.copy()
+        new_env.action_history_short = self.action_history_short.copy()
+        new_env.signature = self.signature.copy()
         new_env.parent_graph = self.parent_graph.copy()
         new_env.solution_object_id = self.solution_object_id
-        
         return new_env
     
     def __repr__(self):

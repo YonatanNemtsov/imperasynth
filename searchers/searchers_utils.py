@@ -347,6 +347,43 @@ def visualize_computational_map(cm: "ComputationalMap", solution_objects: set = 
 ######################## tools for variables defined in ASTs ########################
 
 
+def simulate_simple_stmt(stmt, sim_values: dict, known_funcs: dict) -> bool:
+    """Apply a single FunctionCallAssign or DirectAssign in place on sim_values.
+    Returns True on success, False on missing input var, wrong output count,
+    runtime error, or unrecognized stmt type. Used by both the optimistic
+    body-feasibility check and the exact Phase-3 simulator."""
+    if isinstance(stmt, FunctionCallAssignNode):
+        try:
+            input_vals = tuple(sim_values[arg] for arg in stmt.arg_names)
+        except KeyError:
+            return False
+        func = known_funcs.get(stmt.func_name)
+        if func is None:
+            return False
+        try:
+            outs = func.func(*input_vals)
+        except Exception:
+            return False
+        if not isinstance(outs, (tuple, list)):
+            outs = (outs,)
+        if len(outs) != len(stmt.var_names):
+            return False
+        for v, o in zip(stmt.var_names, outs):
+            sim_values[v] = o
+        return True
+    if isinstance(stmt, DirectAssignNode):
+        try:
+            src_vals = [sim_values[s] for s in stmt.source_vars]
+        except KeyError:
+            return False
+        for s in stmt.source_vars:
+            sim_values.pop(s, None)
+        for t, v in zip(stmt.target_vars, src_vals):
+            sim_values[t] = v
+        return True
+    return False
+
+
 def get_variables_defined_in_node(ast: BlockNode, node_pos: ASTNodePosition) -> set[str]:
     block = ast.get_node_at_position(node_pos)
     if not isinstance(block, BlockNode):
@@ -367,17 +404,21 @@ def get_variables_defined_in_node(ast: BlockNode, node_pos: ASTNodePosition) -> 
 
         elif isinstance(child, IfElseNode):
             else_block = child.else_block
-            final_assignment: DirectAssignNode = else_block.children[-1]
-            for v in final_assignment.target_vars:
-                if v and v[0] == 'x':
-                    defined.add(v)
+            if else_block.children:
+                final_assignment = else_block.children[-1]
+                if isinstance(final_assignment, DirectAssignNode):
+                    for v in final_assignment.target_vars:
+                        if v and v[0] == 'x':
+                            defined.add(v)
 
         elif isinstance(child, WhileNode):
             while_block = child.block
-            final_assignment: DirectAssignNode = while_block.children[-1]
-            for v in final_assignment.target_vars:
-                if v and v[0] == 'x':
-                    defined.add(v)
+            if while_block.children:
+                final_assignment = while_block.children[-1]
+                if isinstance(final_assignment, DirectAssignNode):
+                    for v in final_assignment.target_vars:
+                        if v and v[0] == 'x':
+                            defined.add(v)
 
     return defined
 
@@ -473,18 +514,20 @@ def get_unused_variables_in_ast(ast: BlockNode) -> list[str]:
                     used.add(v)
 
         elif isinstance(last, IfElseNode):
-            final = last.else_block.children[-1]
-            if isinstance(final, DirectAssignNode):
-                for v in final.source_vars:
-                    if v and v[0] == "x":
-                        used.add(v)
+            if last.else_block.children:
+                final = last.else_block.children[-1]
+                if isinstance(final, DirectAssignNode):
+                    for v in final.source_vars:
+                        if v and v[0] == "x":
+                            used.add(v)
 
         elif isinstance(last, WhileNode):
-            final = last.block.children[-1]
-            if isinstance(final, DirectAssignNode):
-                for v in final.source_vars:
-                    if v and v[0] == "x":
-                        used.add(v)
+            if last.block.children:
+                final = last.block.children[-1]
+                if isinstance(final, DirectAssignNode):
+                    for v in final.source_vars:
+                        if v and v[0] == "x":
+                            used.add(v)
 
     unused = defined - used
     return sorted(unused)
@@ -838,13 +881,38 @@ def compute_block_hash(block: BlockNode, variable_hashes: dict[str, int]) -> int
             child_hashes.append(compute_direct_assign_hash(node, var_hashes))
             for i, target in enumerate(node.target_vars):
                 var_hashes[target] = compute_direct_assign_target_hash(i, node.source_vars[i], var_hashes)
-        
+
         elif isinstance(node, IfElseNode):
             if_hash, new_var_hashes = compute_if_else_hash(node, var_hashes)
             var_hashes = new_var_hashes
             child_hashes.append(if_hash)
-    
+
+        elif isinstance(node, WhileNode):
+            while_hash, new_var_hashes = compute_while_hash(node, var_hashes)
+            var_hashes = new_var_hashes
+            child_hashes.append(while_hash)
+
     return hash(tuple(sorted(child_hashes))), var_hashes
+
+
+def compute_while_hash(while_node: 'WhileNode', variable_hashes: dict[str, int]):
+    """Hash a WhileNode and propagate the body's terminating-rebind target_vars
+    out to the surrounding scope (those are the only body vars visible after
+    the loop). Body-internal vars (intermediate computations) stay scoped."""
+    var_hashes = variable_hashes.copy()
+    bool_expr_hash = compute_bool_expr_hash(while_node.bool_expr, var_hashes)
+    body_hash, body_var_hashes = compute_block_hash(while_node.block, var_hashes)
+
+    # Only the body's last DirectAssign target_vars survive past the loop —
+    # those are the rebind that end_while inserts.
+    if while_node.block.children:
+        final = while_node.block.children[-1]
+        if isinstance(final, DirectAssignNode):
+            for tgt in final.target_vars:
+                if tgt in body_var_hashes:
+                    var_hashes[tgt] = body_var_hashes[tgt]
+
+    return hash((bool_expr_hash, body_hash)), var_hashes
 
 def compute_if_else_hash(if_else: IfElseNode, variable_hashes: dict[str, int]):
     var_hashes = variable_hashes.copy()
