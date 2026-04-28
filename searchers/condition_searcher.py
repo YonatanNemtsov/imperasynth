@@ -539,6 +539,175 @@ def create_bool_program_expressions(trace: SimpleCompEnv,  input_var_names: list
 
 
 
+######################## enumerate_realizable_partitions ######################
+
+
+def _available_actions_typed(env: SimpleCompEnv) -> list[ShortAction]:
+    """Enumerate (func_name, input_ids) actions doable in env right now,
+    typed by each known function's input_types. Excludes already-applied
+    actions. Doesn't depend on a comp_map — just type-compatible inputs."""
+    objects_by_type: dict[type, list[ObjId]] = {}
+    for oid, obj in env.objects.items():
+        objects_by_type.setdefault(obj.value_type, []).append(oid)
+
+    out: list[ShortAction] = []
+    for func_name, func in env.known_functions.items():
+        if not func.input_types:
+            cand = (func_name, ())
+            if cand not in env.action_history_short:
+                out.append(cand)
+            continue
+        slots = [objects_by_type.get(t, []) for t in func.input_types]
+        if not all(slots):
+            continue
+        for ids in product(*slots):
+            cand = (func_name, ids)
+            if cand not in env.action_history_short:
+                out.append(cand)
+    return out
+
+
+def _build_per_trace_envs(
+    in_scope_values_per_trace: list[dict],
+    known_funcs: dict,
+    known_bools: dict,
+) -> tuple[list[SimpleCompEnv], list[str]]:
+    """Build one SimpleCompEnv per trace, each seeded with input objects in
+    canonical (sorted-name) order — so input ids match across traces and
+    canonical-id derivation makes the same action sequence produce matching
+    ids in every trace. Returns ([], []) when there are no common variables."""
+    if not in_scope_values_per_trace:
+        return [], []
+    common_vars = set.intersection(*[set(d.keys()) for d in in_scope_values_per_trace])
+    if not common_vars:
+        return [], []
+    var_names = sorted(common_vars)
+    var_types = [type(in_scope_values_per_trace[0][v]) for v in var_names]
+    funcs = {**known_funcs, **known_bools}
+    traces = []
+    for vals in in_scope_values_per_trace:
+        env = SimpleCompEnv(funcs)
+        for name, t in zip(var_names, var_types):
+            env.add_input_object(CompObject(t, vals[name]))
+        traces.append(env)
+    return traces, var_names
+
+
+def _reconstruct_expression(
+    env: SimpleCompEnv,
+    target_oid: ObjId,
+    input_var_names: list[str],
+) -> list:
+    """Walk env.parent_graph backward from target_oid producing helper
+    FunctionCallAssignNodes + a final BoolExprNode. Each *action* (= unique
+    parent tuple) is emitted once with its full output var list. Helper outputs
+    get fresh `b{i}` names; inputs use the supplied input_var_names."""
+    var_dict: dict[ObjId, str] = {
+        oid: name for oid, name in zip(env.input_objects, input_var_names)
+    }
+    # Group all outputs of each action by its parent tuple.
+    parent_to_outs: dict[tuple, list[ObjId]] = {}
+    for oid, parent in env.parent_graph.items():
+        if parent:
+            parent_to_outs.setdefault(parent, []).append(oid)
+    for outs in parent_to_outs.values():
+        outs.sort()
+
+    actions_in_order: list[tuple] = []
+    seen: set[tuple] = set()
+
+    def visit(oid: ObjId):
+        if oid in var_dict:
+            return
+        parent = env.parent_graph.get(oid)
+        if not parent or parent in seen:
+            return
+        seen.add(parent)
+        for inp_id in parent[1:]:
+            visit(inp_id)
+        actions_in_order.append(parent)
+
+    visit(target_oid)
+
+    target_parent = env.parent_graph[target_oid]
+    nodes = []
+    aux = 0
+    for action in actions_in_order:
+        if action == target_parent:
+            continue  # final bool emitted separately
+        func_name, *arg_ids = action
+        outs = parent_to_outs[action]
+        for oid in outs:
+            if oid not in var_dict:
+                var_dict[oid] = f"b{aux}"
+                aux += 1
+        nodes.append(FunctionCallAssignNode(
+            [var_dict[oid] for oid in outs],
+            func_name,
+            [var_dict[a] for a in arg_ids],
+        ))
+    nodes.append(BoolExprNode(
+        target_parent[0], [var_dict[a] for a in target_parent[1:]],
+    ))
+    return nodes
+
+
+def enumerate_realizable_partitions(
+    in_scope_values_per_trace: list[dict],
+    known_funcs: dict,
+    known_bools: dict,
+    max_depth: int,
+) -> dict:
+    """For active traces with the given in-scope variable values, return all
+    distinct True/False partitions realizable by some bool expression of
+    depth ≤ max_depth, mapping each True-set (frozenset of trace indices)
+    to a list of statements (helper FunctionCallAssignNodes + final
+    BoolExprNode) that realizes it. Same expression space search_boolean_traces
+    explores, but in one pass — shorter expressions win when multiple realize
+    the same partition."""
+    traces, var_names = _build_per_trace_envs(in_scope_values_per_trace, known_funcs, known_bools)
+    if not traces:
+        return {}
+    n = len(traces)
+
+    obj_depths: dict[ObjId, int] = {oid: 0 for oid in traces[0].input_objects}
+    realizable: dict = {}
+
+    while True:
+        avail_per_trace = [set(_available_actions_typed(t)) for t in traces]
+        common = set.intersection(*avail_per_trace) if avail_per_trace else set()
+        progressed = False
+        for action in common:
+            func_name, input_ids = action
+            in_depths = [obj_depths.get(oid, 0) for oid in input_ids]
+            action_depth = (max(in_depths) if in_depths else 0) + 1
+            if action_depth > max_depth:
+                continue
+
+            outputs_per_trace = [env.apply_function(func_name, input_ids) for env in traces]
+            for outs in outputs_per_trace:
+                for oid in outs:
+                    obj_depths[oid] = action_depth
+            progressed = True
+
+            for output_idx in range(len(outputs_per_trace[0])):
+                first_oid = outputs_per_trace[0][output_idx]
+                if traces[0].objects[first_oid].value_type is not bool:
+                    continue
+                values = tuple(
+                    traces[i].objects[outputs_per_trace[i][output_idx]].value
+                    for i in range(n)
+                )
+                true_set = frozenset(i for i, v in enumerate(values) if v)
+                if true_set not in realizable:
+                    realizable[true_set] = _reconstruct_expression(traces[0], first_oid, var_names)
+
+        if not progressed:
+            break
+
+    return realizable
+
+
 ####################### TODO: make this into a nice class structure, with good interface etc #############################
 
 class ConditionSearcher:
