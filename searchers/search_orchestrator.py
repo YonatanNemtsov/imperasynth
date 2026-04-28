@@ -93,6 +93,7 @@ class StartIfCandidate:
     exec_position: ExecutionPositionTuple
     if_indices: Tuple[int, ...]                 # may be empty (per your choice A)
     else_indices: Tuple[int, ...]               # may be empty
+    realizing_depth: int = 0                    # depth of bool expr that produces this partition
 
 @dataclass(slots=True)
 class EndIfCandidate:
@@ -110,6 +111,7 @@ class EndElseCandidate:
 class StartWhileCandidate:
     exec_position: ExecutionPositionTuple
     while_indices: Tuple[int, ...]   # traces that enter the loop body at least once
+    realizing_depth: int = 0
 
 @dataclass(slots=True)
 class EndWhileCandidate:
@@ -122,6 +124,7 @@ class EndWhileCandidate:
 class EnterWhileCandidate:
     exec_position: ExecutionPositionTuple
     while_indices: Tuple[int, ...]   # traces that take this iteration
+    realizing_depth: int = 0
 
 @dataclass(slots=True)
 class SkipWhileCandidate:
@@ -144,6 +147,7 @@ class ExecuteIfElseCandidate:
     exec_position: ExecutionPositionTuple
     if_indices: Tuple[int, ...]      # traces that took the if branch
     group_indices: Tuple[int, ...]   # all traces active at this if/else
+    realizing_depth: int = 0
 
 @dataclass(slots=True)
 class ExecuteDirectAssignCandidate:
@@ -156,14 +160,19 @@ class ExecuteDirectAssignCandidate:
 ################################### Search State #################################
 
 class SearchState:
-    def __init__(self, trace_group: tsr.TraceGroup, ast_group: asr.AnnotatedAstGroup, aug_stack: asr.AugmentationStack, initial_vars: list[dict[str, ObjId]], variable_states: list[dict[str, ObjId]], search_concluded: bool):
+    def __init__(self, trace_group: tsr.TraceGroup, ast_group: asr.AnnotatedAstGroup, aug_stack: asr.AugmentationStack, initial_vars: list[dict[str, ObjId]], variable_states: list[dict[str, ObjId]], search_concluded: bool, max_realizing_depth: int = 0):
         self.trace_group = trace_group
         self.ast_group = ast_group
         self.aug_stack = aug_stack
         self.initial_vars = initial_vars
         self.variable_states = variable_states
         self.search_concluded = search_concluded
-        
+        # Max BFS depth among realizing expressions chosen along this path.
+        # Updated by apply_*_candidate when the candidate carries a realizing
+        # depth (StartIf, ExecuteIfElse, StartWhile, EnterWhile). Used as a
+        # priority dimension in score_state.
+        self.max_realizing_depth = max_realizing_depth
+
 
     @staticmethod
     def init_new_search_state_from_problem_and_funcs(problem: Problem, known_funcs: dict[FunctionName, Function]):
@@ -173,10 +182,10 @@ class SearchState:
         aug_stack = asr.AugmentationStack.init_new_stack(set(i for i in range(len(problem.instances))))
         search_concluded = False
         return SearchState(trace_group, ast_group, aug_stack, initial_var_states.copy(), initial_var_states.copy(), search_concluded)
-    
+
     def copy(self):
         # shallow copies of structures that are already cloned internally
-        return SearchState(self.trace_group.copy(), self.ast_group.copy(), self.aug_stack.copy(), deepcopy(self.initial_vars), deepcopy(self.variable_states), self.search_concluded)
+        return SearchState(self.trace_group.copy(), self.ast_group.copy(), self.aug_stack.copy(), deepcopy(self.initial_vars), deepcopy(self.variable_states), self.search_concluded, self.max_realizing_depth)
 
     def __repr__(self):
         return f"SearchState(n_traces={len(self.trace_group.traces)}, ast={self.ast_group.ast})"
@@ -222,6 +231,7 @@ class SearchState:
 
         ns.ast_group = asr.apply_augmentation_start_if_group(ns.ast_group, cand.exec_position)
         ns.aug_stack.apply_transition(asr.AUG_START_IF, set(cand.if_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
 
         if not ns.aug_stack.stack:
             ns.search_concluded = True
@@ -270,6 +280,7 @@ class SearchState:
         ns = self.copy()
         ns.ast_group = asr.apply_augmentation_start_while_group(ns.ast_group, cand.exec_position)
         ns.aug_stack.apply_transition(asr.AUG_START_WHILE, set(cand.while_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
         return ns
@@ -309,6 +320,7 @@ class SearchState:
         when the body's execute_* candidates fire next."""
         ns = self.copy()
         ns.aug_stack.apply_transition(asr.AUG_ENTER_WHILE, set(cand.while_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
         return ns
@@ -379,6 +391,7 @@ class SearchState:
         traces that take it."""
         ns = self.copy()
         ns.aug_stack.apply_transition(asr.AUG_EXECUTE_IF_ELSE, set(cand.if_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
         return ns
@@ -496,19 +509,81 @@ def generate_func_call_candidates(state: SearchState, request: AugmentationReque
     ]
     return candidates
 
-def generate_start_if_candidates(state: SearchState, request: AugmentationRequestStartIf, cmaps: list[ComputationalMap]) -> list[StartIfCandidate]:
-    candidates = [StartIfCandidate(request.exec_position, if_indices, request.group_indices.difference(if_indices)) for if_indices in tsr.find_possible_start_if_actions(request.group_indices)]
+def generate_start_if_candidates(
+    state: SearchState,
+    request: AugmentationRequestStartIf,
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list[StartIfCandidate]:
+    """Build-phase if/else split — both branches must be non-empty (a dead
+    branch makes no sense at build time). With realizable_fn, restricts to
+    partitions some bool expression of depth ≤ max_depth can realize on the
+    active traces' in-scope values."""
+    group_indices = request.group_indices
+    if realizable_fn is None:
+        return [
+            StartIfCandidate(request.exec_position, if_indices, group_indices.difference(if_indices))
+            for if_indices in tsr.find_possible_start_if_actions(group_indices)
+        ]
+
+    active = sorted(group_indices)
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
+    ]
+    partitions = realizable_fn(in_scope, max_depth)
+    # Sort by realizing-expression depth (simpler first → enqueued first →
+    # smaller tie counter → popped first by score_state).
+    candidates = []
+    for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0]):
+        if_indices = frozenset(active[i] for i in local)
+        if not if_indices or if_indices == frozenset(active):
+            continue  # both branches must be non-empty
+        candidates.append(StartIfCandidate(
+            request.exec_position, if_indices, group_indices.difference(if_indices),
+            realizing_depth=depth,
+        ))
     return candidates
 
 def generate_end_if_candidates(state: SearchState, request: AugmentationRequestEndIf, cmaps: list[ComputationalMap]) -> list[EndIfCandidate]:
     return [EndIfCandidate(request.group_indices)]
 
 
-def generate_start_while_candidates(state: SearchState, request: 'AugmentationRequestStartWhile', cmaps: list[ComputationalMap]) -> list['StartWhileCandidate']:
-    return [
-        StartWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
-        for while_indices in tsr.find_possible_start_while_actions(request.group_indices)
+def generate_start_while_candidates(
+    state: SearchState,
+    request: 'AugmentationRequestStartWhile',
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list['StartWhileCandidate']:
+    """Build-phase: which traces enter the loop at least once. The (still-TBD)
+    while condition will be evaluated pre-loop; entering traces are those
+    where it returns True. With realizable_fn, restricts to True-sets some
+    bool expression of depth ≤ max_depth can realize. Empty subset is dropped
+    (no traces entering = no while loop)."""
+    group_indices = request.group_indices
+    if realizable_fn is None:
+        return [
+            StartWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
+            for while_indices in tsr.find_possible_start_while_actions(group_indices)
+        ]
+
+    active = sorted(group_indices)
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
     ]
+    partitions = realizable_fn(in_scope, max_depth)
+    candidates = []
+    for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0]):
+        if not local:
+            continue  # empty subset = no traces enter = no while loop
+        while_indices = tuple(sorted(active[i] for i in local))
+        candidates.append(StartWhileCandidate(request.exec_position, while_indices, realizing_depth=depth))
+    return candidates
 
 
 def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequestEndWhile', cmaps: list[ComputationalMap]) -> list['EndWhileCandidate']:
@@ -578,19 +653,44 @@ def _can_trace_execute_while_body(state: SearchState, trace_idx: int, body: Bloc
     return True
 
 
-def generate_enter_while_candidates(state: SearchState, request: 'AugmentationRequestEnterWhile', cmaps: list[ComputationalMap]) -> list['EnterWhileCandidate']:
-    """Enumerate which traces take this iteration, but only over the subset of
-    traces whose loop body would actually execute successfully on their current
-    variable state. Traces that can't (e.g. empty-list trace + get_head body)
-    are excluded — the search would otherwise crash on KeyError downstream."""
+def generate_enter_while_candidates(
+    state: SearchState,
+    request: 'AugmentationRequestEnterWhile',
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list['EnterWhileCandidate']:
+    """Execute-phase: which traces take another iteration. Two filters apply:
+    (1) the body has to actually execute on the trace's current state (e.g.
+    head-of-empty-list would crash); (2) with realizable_fn, the True-set
+    has to match some bool expression on the active traces' in-scope values
+    — Phase 3 will pick that very expression as the while condition."""
     while_node = state.ast_group.ast.get_node_at_position(request.exec_position[0])
     body = while_node.block
     valid = {i for i in request.group_indices
              if _can_trace_execute_while_body(state, i, body)}
-    return [
-        EnterWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
-        for while_indices in tsr.find_possible_start_while_actions(valid)
+    if realizable_fn is None:
+        return [
+            EnterWhileCandidate(request.exec_position, tuple(sorted(while_indices)))
+            for while_indices in tsr.find_possible_start_while_actions(valid)
+        ]
+
+    active = sorted(valid)
+    if not active:
+        return []
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
     ]
+    partitions = realizable_fn(in_scope, max_depth)
+    candidates = []
+    for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0]):
+        if not local:
+            continue
+        while_indices = tuple(sorted(active[i] for i in local))
+        candidates.append(EnterWhileCandidate(request.exec_position, while_indices, realizing_depth=depth))
+    return candidates
 
 
 def generate_skip_while_candidates(state: SearchState, request: 'AugmentationRequestSkipWhile', cmaps: list[ComputationalMap]) -> list['SkipWhileCandidate']:
@@ -608,12 +708,39 @@ def generate_execute_func_call_candidates(state: SearchState, request: 'Augmenta
     return [ExecuteFuncCallCandidate(request.exec_position, tuple(sorted(request.group_indices)))]
 
 
-def generate_execute_if_else_candidates(state: SearchState, request: 'AugmentationRequestExecuteIfElse', cmaps: list[ComputationalMap]) -> list['ExecuteIfElseCandidate']:
-    # Use the execute-phase enumerator (allows ∅ and full set), NOT the
-    # start_if one (which excludes both — only correct for build phase).
+def generate_execute_if_else_candidates(
+    state: SearchState,
+    request: 'AugmentationRequestExecuteIfElse',
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list['ExecuteIfElseCandidate']:
+    """Per-iteration if/else split. If `realizable_fn` is provided, only
+    enumerate partitions that some bool expression of depth ≤ max_depth
+    could realize on the active traces' in-scope values — every other
+    subset would be rejected by Phase 3 anyway."""
+    group_indices = request.group_indices
+    if realizable_fn is None:
+        return [
+            ExecuteIfElseCandidate(request.exec_position, tuple(sorted(if_indices)), tuple(sorted(group_indices)))
+            for if_indices in tsr.find_possible_execute_if_else_actions(group_indices)
+        ]
+
+    active = sorted(group_indices)
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
+    ]
+    partitions = realizable_fn(in_scope, max_depth)
     return [
-        ExecuteIfElseCandidate(request.exec_position, tuple(sorted(if_indices)), tuple(sorted(request.group_indices)))
-        for if_indices in tsr.find_possible_execute_if_else_actions(request.group_indices)
+        ExecuteIfElseCandidate(
+            request.exec_position,
+            tuple(sorted(active[i] for i in local)),
+            tuple(sorted(group_indices)),
+            realizing_depth=depth,
+        )
+        for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0])
     ]
 
 
@@ -738,18 +865,20 @@ def count_node_type(node: ASTNode, target_type) -> int:
 
 
 def score_state(state: SearchState, problem: Problem, cmaps: list["ComputationalMap"], tie_breaker: int):
-    """Priority key (lower → explored first).
+    """Priority key (lower → explored first), lex-compared.
 
-    Primary: ast_size (the actual program complexity). Stack depth is
-    intentionally NOT included — execute-phase operations swell the stack
-    but don't change the AST.
-    Secondary: importance_dist (estimated remaining work to reach targets).
-    Tertiary: tie_breaker (FIFO among equal-priority states).
+    1. ast_size — actual program complexity. Stack depth not included
+       (execute-phase swells the stack without changing the AST).
+    2. importance_dist — estimated remaining trace work to reach targets.
+    3. max_realizing_depth — max BFS depth among bool expressions chosen
+       along this path (StartIf/StartWhile/Enter/ExecuteIfElse). Lower =
+       simpler conditions = preferred. Updated by apply_*_candidate.
+    4. tie_breaker — FIFO among equal-priority states.
     """
     targets = [problem.instances[i][1][0] for i in range(len(problem.instances))]
     ast_size = compute_ast_size(state.ast_group.ast)
     importance_dist = estimate_final_trace_length(state, cmaps, targets)
-    return (ast_size, importance_dist, tie_breaker)
+    return (ast_size, importance_dist, state.max_realizing_depth, tie_breaker)
 
 
 ##################### Orchestrator ###################################
@@ -767,11 +896,30 @@ class SearchOrchestrator:
         self.visited_states = set()
         self.tie_counter = 0
         self.last_processed_state = None
+        # Shared across the orchestrator's lifetime; caches realizable
+        # partitions by per-trace value tuples (so different search states
+        # asking the same question hit the same entry).
+        self.bool_env = csr.BoolSearchEnvironment(known_funcs, known_bools, max_depth=2)
 
 
         # store completed programs (states with concluded search)
         self.program_skeleton_candidates: list[SearchState] = []
         self.completed_programs: list[SearchState] = []
+
+    def realizable_partitions(self, in_scope_values_per_trace: list[dict], max_depth: int = 2) -> dict:
+        """Caller-friendly wrapper around BoolSearchEnvironment. Pulls out
+        common in-scope vars, builds the value-tuple key, and delegates."""
+        if not in_scope_values_per_trace:
+            return {}
+        common_vars = set.intersection(*[set(d.keys()) for d in in_scope_values_per_trace])
+        if not common_vars:
+            return {}
+        var_names = sorted(common_vars)
+        value_tuples_per_input = tuple(
+            tuple(d[name] for d in in_scope_values_per_trace)
+            for name in var_names
+        )
+        return self.bool_env.realizable_partitions(value_tuples_per_input, var_names)
 
     # -----------------------------------------------------------------
     @staticmethod
@@ -831,17 +979,17 @@ class SearchOrchestrator:
             if isinstance(req, AugmentationRequestFuncCall):
                 candidates = generate_func_call_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestStartIf):
-                candidates = generate_start_if_candidates(state, req, self.cmaps)
+                candidates = generate_start_if_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestEndIf):
                 candidates = generate_end_if_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestEndElse):
                 candidates = generate_end_else_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestStartWhile):
-                candidates = generate_start_while_candidates(state, req, self.cmaps)
+                candidates = generate_start_while_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestEndWhile):
                 candidates = generate_end_while_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestEnterWhile):
-                candidates = generate_enter_while_candidates(state, req, self.cmaps)
+                candidates = generate_enter_while_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestSkipWhile):
                 candidates = generate_skip_while_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestExecuteBlock):
@@ -849,7 +997,7 @@ class SearchOrchestrator:
             elif isinstance(req, AugmentationRequestExecuteFuncCall):
                 candidates = generate_execute_func_call_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestExecuteIfElse):
-                candidates = generate_execute_if_else_candidates(state, req, self.cmaps)
+                candidates = generate_execute_if_else_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestExecuteDirectAssign):
                 candidates = generate_execute_direct_assign_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestReturn):

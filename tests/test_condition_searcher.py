@@ -6,6 +6,7 @@ and searches for a small bool program that explains the labels.
 """
 from searchers.condition_searcher import (
     create_bool_program_expressions,
+    enumerate_realizable_partitions,
     extract_ifelse_conditional_problem,
     extract_while_conditional_problem,
     get_conditional_problem_instances_from_annotated_ast_and_ifelse_node_position,
@@ -194,3 +195,63 @@ def test_create_bool_program_expressions_builds_function_call_chain():
     assert isinstance(statements[-1], BoolExprNode)
     for stmt in statements[:-1]:
         assert isinstance(stmt, FunctionCallAssignNode)
+
+
+# ---------- enumerate_realizable_partitions ----------
+
+def test_enumerate_realizable_partitions_sum_of_evens_iter1():
+    """At sum-of-evens iter-1 if/else, the right partition {0,3} | {1,2}
+    (traces with even head) must be realizable via is_even(x2). Constants
+    {} and {0,1,2,3} are also realizable via is_even(x1) (always-True for
+    x1=0). Subsets that no bool can produce — e.g. {0,1} — must be absent."""
+    funcs = {
+        "add": Function(lambda x, y: (x + y,), [int, int], [int]),
+        "get_head": Function(lambda lst: ((lst[0],) if lst else ()), [tuple], [int]),
+        "get_tail": Function(lambda lst: ((lst[1:],) if lst else ((),)), [tuple], [tuple]),
+    }
+    bools = {
+        "is_empty": BoolFunction(lambda lst: ((len(lst) == 0,)), [tuple], [bool]),
+        "is_even": BoolFunction(lambda x: (x % 2 == 0,), [int], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
+    }
+
+    # Per-trace in-scope values at the if/else (after head, tail in body).
+    in_scope = [
+        {"x0": (2,),       "x1": 0, "x2": 2, "x3": ()},
+        {"x0": (1,),       "x1": 0, "x2": 1, "x3": ()},
+        {"x0": (1, 2),     "x1": 0, "x2": 1, "x3": (2,)},
+        {"x0": (2, 3, 4),  "x1": 0, "x2": 2, "x3": (3, 4)},
+    ]
+
+    partitions = enumerate_realizable_partitions(in_scope, funcs, bools, max_depth=2)
+
+    # The discriminating partition for is_even(x2) is {0, 3}.
+    assert frozenset({0, 3}) in partitions, f"missing {{0,3}}; got {set(partitions.keys())}"
+    # is_empty(x3) discriminates {0,1} vs {2,3}: {2,3} (or {0,1} via not(...)) should be realizable.
+    assert frozenset({2, 3}) in partitions or frozenset({0, 1}) in partitions
+
+    # A partition no primitive bool produces, e.g. {0, 2}, must be absent
+    # (no bool maps trace 0 and 2 to True while 1 and 3 to False with these inputs).
+    assert frozenset({0, 2}) not in partitions
+
+    # The realizing expression for {0, 3} must end in a BoolExprNode.
+    depth, stmts = partitions[frozenset({0, 3})]
+    assert depth == 1, f"is_even(x2) is depth-1, got {depth}"
+    assert isinstance(stmts[-1], BoolExprNode)
+
+
+def test_enumerate_realizable_partitions_constants_present():
+    """Constant-true and constant-false partitions are realizable when any
+    bool function returns the same value on every trace."""
+    funcs = {}
+    bools = {
+        "is_zero": BoolFunction(lambda x: (x == 0,), [int], [bool]),
+    }
+    in_scope = [
+        {"x0": 5},
+        {"x0": 7},
+        {"x0": 3},
+    ]
+    partitions = enumerate_realizable_partitions(in_scope, funcs, bools, max_depth=2)
+    # is_zero(x0) is False on all → empty True-set is realizable.
+    assert frozenset() in partitions

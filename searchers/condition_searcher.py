@@ -539,6 +539,218 @@ def create_bool_program_expressions(trace: SimpleCompEnv,  input_var_names: list
 
 
 
+######################## BoolSearchEnvironment ######################
+
+
+class BoolSearchEnvironment:
+    """Stateful, value-canonicalized bool expression search.
+
+    Each "object" in this env is identified by its per-trace value tuple,
+    not by a SimpleCompEnv-style canonical id. Two expressions producing
+    the same value tuple (e.g. `add(x, x)` and `mult(x, 2)` when 2 is
+    available) collapse to one node — the dominant cost saver for
+    realizability queries on rich function spaces.
+
+    `realizable_partitions(value_tuples)` returns {True-set: stmts} for
+    a given list of input value tuples (one per trace, each a tuple of
+    typed values in canonical input order). Cached by the value tuples
+    themselves — same in-scope values across different search states /
+    variable names hit the same cache entry."""
+
+    def __init__(self, known_funcs: dict, known_bools: dict, max_depth: int = 2):
+        self.known_funcs = known_funcs
+        self.known_bools = known_bools
+        self.max_depth = max_depth
+        # key: tuple(value_tuple_per_input) → {true_set: list[stmts]}
+        self._cache: dict = {}
+
+    def realizable_partitions(
+        self,
+        value_tuples_per_input: tuple,
+        input_var_names: list[str],
+    ) -> dict:
+        """value_tuples_per_input: tuple of length num_inputs. Each entry
+        is a tuple of length n_traces giving the input's value in each trace.
+        input_var_names: names assigned to each input in the realizing
+        expressions. Returns {frozenset[trace_idx]: (depth, list[stmts])}
+        — depth is the BFS depth at which the partition was first realized
+        (lower = simpler expression = better quality signal for the caller)."""
+        cache_key = value_tuples_per_input
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        result = self._enumerate(value_tuples_per_input, input_var_names)
+        self._cache[cache_key] = result
+        return result
+
+    def _enumerate(self, value_tuples_per_input, input_var_names):
+        all_funcs = {**self.known_funcs, **self.known_bools}
+        n_inputs = len(value_tuples_per_input)
+        if n_inputs == 0 or any(len(vt) == 0 for vt in value_tuples_per_input):
+            return {}
+        n_traces = len(value_tuples_per_input[0])
+
+        # Each canonical "node" is identified by its per-trace value tuple.
+        # nodes: list of (value_tuple, type, depth, parent) — parent is
+        # (func_name, input_node_ids, output_idx) or None for inputs.
+        nodes: list = []
+        value_to_node: dict = {}
+        nodes_by_type: dict = {}
+
+        def add_node(value_tuple, t, depth, parent):
+            # Key by (type, value_tuple): without the type, Python's
+            # bool↔int equivalence (False == 0, True == 1) collapses bool
+            # outputs onto int input nodes when values coincidentally match.
+            key = (t, value_tuple)
+            if key in value_to_node:
+                return value_to_node[key]
+            nid = len(nodes)
+            nodes.append((value_tuple, t, depth, parent))
+            value_to_node[key] = nid
+            nodes_by_type.setdefault(t, []).append(nid)
+            return nid
+
+        # Inputs
+        for i, vt in enumerate(value_tuples_per_input):
+            t = type(vt[0]) if vt else type(None)
+            add_node(tuple(vt), t, 0, None)
+
+        realizable: dict = {}
+        applied_action_sigs: set = set()
+
+        for depth in range(1, self.max_depth + 1):
+            progressed = False
+            for func_name, func in all_funcs.items():
+                slots = [nodes_by_type.get(t, []) for t in func.input_types]
+                if func.input_types and not all(slots):
+                    continue
+                arg_id_combos = product(*slots) if func.input_types else [()]
+                for input_ids in arg_id_combos:
+                    in_depths = [nodes[i][2] for i in input_ids]
+                    action_depth = (max(in_depths) if in_depths else 0) + 1
+                    if action_depth != depth:
+                        continue
+                    sig = (func_name, input_ids)
+                    if sig in applied_action_sigs:
+                        continue
+                    applied_action_sigs.add(sig)
+
+                    # Apply per-trace; build output value tuples.
+                    input_value_tuples = [nodes[i][0] for i in input_ids]
+                    per_trace_outputs = []
+                    failed = False
+                    for tr in range(n_traces):
+                        args = tuple(ivt[tr] for ivt in input_value_tuples)
+                        try:
+                            outs = func.func(*args)
+                        except Exception:
+                            failed = True
+                            break
+                        if not isinstance(outs, (tuple, list)):
+                            outs = (outs,)
+                        per_trace_outputs.append(outs)
+                    if failed:
+                        continue
+
+                    num_outs = min(len(o) for o in per_trace_outputs) if per_trace_outputs else 0
+                    if num_outs == 0:
+                        continue
+                    progressed = True
+
+                    for out_idx in range(num_outs):
+                        out_vt = tuple(per_trace_outputs[tr][out_idx] for tr in range(n_traces))
+                        out_type = func.output_types[out_idx] if out_idx < len(func.output_types) else type(out_vt[0])
+                        new_node_id = add_node(out_vt, out_type, action_depth, (func_name, input_ids, out_idx))
+                        if out_type is bool:
+                            true_set = frozenset(i for i, v in enumerate(out_vt) if v)
+                            if true_set not in realizable:
+                                realizable[true_set] = (action_depth, _reconstruct_canonical(new_node_id, nodes, input_var_names))
+            if not progressed:
+                break
+
+        return realizable
+
+
+def _reconstruct_canonical(target_id: int, nodes: list, input_var_names: list[str]) -> list:
+    """Walk the canonical-DAG backward from target_id. Inputs are nodes
+    0..len(input_var_names)-1 with parent=None. Helper outputs get fresh
+    b{i} names; the final node becomes a BoolExprNode."""
+    n_inputs = len(input_var_names)
+    var_dict: dict = {i: input_var_names[i] for i in range(n_inputs)}
+
+    actions_by_sig: dict = {}  # (func_name, input_ids) → list of (out_idx, node_id)
+    for nid, (_, _, _, parent) in enumerate(nodes):
+        if parent is None:
+            continue
+        func_name, input_ids, out_idx = parent
+        actions_by_sig.setdefault((func_name, input_ids), []).append((out_idx, nid))
+    for v in actions_by_sig.values():
+        v.sort()
+
+    visit_order: list = []
+    seen_sigs: set = set()
+
+    def visit(nid: int):
+        if nid < n_inputs:
+            return
+        parent = nodes[nid][3]
+        sig = (parent[0], parent[1])
+        if sig in seen_sigs:
+            return
+        seen_sigs.add(sig)
+        for inp_id in parent[1]:
+            visit(inp_id)
+        visit_order.append(sig)
+
+    visit(target_id)
+
+    target_parent = nodes[target_id][3]
+    target_sig = (target_parent[0], target_parent[1])
+
+    stmts = []
+    aux = 0
+    for sig in visit_order:
+        if sig == target_sig:
+            continue
+        func_name, input_ids = sig
+        outs = actions_by_sig[sig]  # list of (out_idx, node_id)
+        out_names = []
+        for _, nid in outs:
+            if nid not in var_dict:
+                var_dict[nid] = f"b{aux}"
+                aux += 1
+            out_names.append(var_dict[nid])
+        stmts.append(FunctionCallAssignNode(
+            out_names, func_name, [var_dict[a] for a in input_ids],
+        ))
+    stmts.append(BoolExprNode(
+        target_parent[0], [var_dict[a] for a in target_parent[1]],
+    ))
+    return stmts
+
+
+def enumerate_realizable_partitions(
+    in_scope_values_per_trace: list[dict],
+    known_funcs: dict,
+    known_bools: dict,
+    max_depth: int,
+) -> dict:
+    """Convenience wrapper: build a one-shot BoolSearchEnvironment and query.
+    For repeated queries with the same library, instantiate BoolSearchEnvironment
+    once and call realizable_partitions on it (cached by value tuples)."""
+    if not in_scope_values_per_trace:
+        return {}
+    common_vars = set.intersection(*[set(d.keys()) for d in in_scope_values_per_trace])
+    if not common_vars:
+        return {}
+    var_names = sorted(common_vars)
+    value_tuples_per_input = tuple(
+        tuple(d[name] for d in in_scope_values_per_trace)
+        for name in var_names
+    )
+    env = BoolSearchEnvironment(known_funcs, known_bools, max_depth)
+    return env.realizable_partitions(value_tuples_per_input, var_names)
+
+
 ####################### TODO: make this into a nice class structure, with good interface etc #############################
 
 class ConditionSearcher:
