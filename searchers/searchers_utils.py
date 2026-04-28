@@ -347,6 +347,43 @@ def visualize_computational_map(cm: "ComputationalMap", solution_objects: set = 
 ######################## tools for variables defined in ASTs ########################
 
 
+def simulate_simple_stmt(stmt, sim_values: dict, known_funcs: dict) -> bool:
+    """Apply a single FunctionCallAssign or DirectAssign in place on sim_values.
+    Returns True on success, False on missing input var, wrong output count,
+    runtime error, or unrecognized stmt type. Used by both the optimistic
+    body-feasibility check and the exact Phase-3 simulator."""
+    if isinstance(stmt, FunctionCallAssignNode):
+        try:
+            input_vals = tuple(sim_values[arg] for arg in stmt.arg_names)
+        except KeyError:
+            return False
+        func = known_funcs.get(stmt.func_name)
+        if func is None:
+            return False
+        try:
+            outs = func.func(*input_vals)
+        except Exception:
+            return False
+        if not isinstance(outs, (tuple, list)):
+            outs = (outs,)
+        if len(outs) != len(stmt.var_names):
+            return False
+        for v, o in zip(stmt.var_names, outs):
+            sim_values[v] = o
+        return True
+    if isinstance(stmt, DirectAssignNode):
+        try:
+            src_vals = [sim_values[s] for s in stmt.source_vars]
+        except KeyError:
+            return False
+        for s in stmt.source_vars:
+            sim_values.pop(s, None)
+        for t, v in zip(stmt.target_vars, src_vals):
+            sim_values[t] = v
+        return True
+    return False
+
+
 def get_variables_defined_in_node(ast: BlockNode, node_pos: ASTNodePosition) -> set[str]:
     block = ast.get_node_at_position(node_pos)
     if not isinstance(block, BlockNode):

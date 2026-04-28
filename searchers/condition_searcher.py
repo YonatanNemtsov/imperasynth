@@ -219,33 +219,9 @@ def _simulate_block_until(block: BlockNode, target_idx: int, sim_values: dict,
     is false). Returns False on any unevaluable condition or runtime error.
     """
     for stmt in block.statements[:target_idx]:
-        if isinstance(stmt, FunctionCallAssignNode):
-            try:
-                input_vals = tuple(sim_values[arg] for arg in stmt.arg_names)
-            except KeyError:
+        if isinstance(stmt, (FunctionCallAssignNode, DirectAssignNode)):
+            if not simulate_simple_stmt(stmt, sim_values, known_funcs):
                 return False
-            func = known_funcs.get(stmt.func_name)
-            if func is None:
-                return False
-            try:
-                outs = func.func(*input_vals)
-            except Exception:
-                return False
-            if not isinstance(outs, (tuple, list)):
-                outs = (outs,)
-            if len(outs) != len(stmt.var_names):
-                return False
-            for v, o in zip(stmt.var_names, outs):
-                sim_values[v] = o
-        elif isinstance(stmt, DirectAssignNode):
-            try:
-                src_vals = [sim_values[s] for s in stmt.source_vars]
-            except KeyError:
-                return False
-            for s in stmt.source_vars:
-                sim_values.pop(s, None)
-            for t, v in zip(stmt.target_vars, src_vals):
-                sim_values[t] = v
         elif isinstance(stmt, IfElseNode):
             cond = _eval_bool_expr(stmt.bool_expr, sim_values, known_bools)
             if cond is None:

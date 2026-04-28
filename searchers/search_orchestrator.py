@@ -550,66 +550,31 @@ def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequ
 def _can_trace_execute_while_body(state: SearchState, trace_idx: int, body: BlockNode) -> bool:
     """Simulate the while body's statements on a trace's current value state.
 
-    Returns True iff every FunctionCallAssignNode produces the expected number
-    of outputs (so var_names actually get assigned) and every DirectAssignNode's
-    sources are in scope. We work directly with VALUES (no object/id machinery)
-    since this is a check, not a state mutation.
-
-    Nested if/else/while inside the body are treated optimistically (assumed
-    valid) — full simulation of those would require condition resolution, which
-    we don't have until Phase 3. For straight-line bodies this is exact.
+    Returns True iff every straight-line stmt produces consistent outputs.
+    Nested if/else/while are treated *optimistically* — we don't have their
+    conditions until Phase 3, so we just inject the vars that would survive
+    past end_else / end_while (the last DirectAssign's target_vars) so any
+    downstream stmt consuming those vars doesn't false-fail the check.
     """
     trace = state.trace_group.traces[trace_idx]
     sim_values = {k: trace.objects[v].value for k, v in state.variable_states[trace_idx].items()}
 
     for child in body.children:
-        if isinstance(child, FunctionCallAssignNode):
-            try:
-                input_vals = tuple(sim_values[arg] for arg in child.arg_names)
-            except KeyError:
+        if isinstance(child, (FunctionCallAssignNode, DirectAssignNode)):
+            if not simulate_simple_stmt(child, sim_values, trace.known_functions):
                 return False
-            func = trace.known_functions.get(child.func_name)
-            if func is None:
-                return False
-            try:
-                outputs = func.func(*input_vals)
-            except Exception:
-                return False
-            if not isinstance(outputs, (tuple, list)):
-                outputs = (outputs,)
-            if len(outputs) != len(child.var_names):
-                return False
-            for var, val in zip(child.var_names, outputs):
-                sim_values[var] = val
-        elif isinstance(child, DirectAssignNode):
-            try:
-                src_vals = [sim_values[s] for s in child.source_vars]
-            except KeyError:
-                return False
-            for s in child.source_vars:
-                sim_values.pop(s, None)
-            for tgt, val in zip(child.target_vars, src_vals):
-                sim_values[tgt] = val
         elif isinstance(child, IfElseNode):
-            # Optimistic for branch contents, but we DO need vars that survive
-            # past end_else — those are the else block's last DirectAssign
-            # target_vars (mirrors get_variables_defined_in_node). Without this,
-            # a downstream stmt that consumes the merged var fails the check.
-            else_block = child.else_block
-            if else_block.children:
-                final = else_block.children[-1]
-                if isinstance(final, DirectAssignNode):
-                    for tgt, src in zip(final.target_vars, final.source_vars):
-                        sim_values[tgt] = sim_values.get(src)
-        elif isinstance(child, WhileNode):
-            # Same idea for nested whiles: the body's last DirectAssign
-            # target_vars survive past end_while.
-            inner = child.block
-            if inner.children:
+            inner = child.else_block
+            if inner.children and isinstance(inner.children[-1], DirectAssignNode):
                 final = inner.children[-1]
-                if isinstance(final, DirectAssignNode):
-                    for tgt, src in zip(final.target_vars, final.source_vars):
-                        sim_values[tgt] = sim_values.get(src)
+                for tgt, src in zip(final.target_vars, final.source_vars):
+                    sim_values[tgt] = sim_values.get(src)
+        elif isinstance(child, WhileNode):
+            inner = child.block
+            if inner.children and isinstance(inner.children[-1], DirectAssignNode):
+                final = inner.children[-1]
+                for tgt, src in zip(final.target_vars, final.source_vars):
+                    sim_values[tgt] = sim_values.get(src)
     return True
 
 
