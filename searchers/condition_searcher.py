@@ -186,11 +186,37 @@ def extract_while_conditional_problem(annotated_ast: AnnotatedAST, while_node_po
     return InterDependentProblemGroup(problem_group), var_names
 
 
-def _simulate_block_until(block: BlockNode, target_idx: int, sim_values: dict, known_funcs: dict) -> bool:
+TBD_CONDITIONAL_STR = "TBD_CONDITIONAL"
+
+
+def _eval_bool_expr(bool_expr: BoolExprNode, sim_values: dict, known_bools: dict) -> bool | None:
+    """Evaluate a BoolExprNode against sim_values. Returns None if unevaluable
+    (TBD condition, missing var, or unknown bool function)."""
+    if bool_expr.bool_func == TBD_CONDITIONAL_STR:
+        return None
+    bf = (known_bools or {}).get(bool_expr.bool_func)
+    if bf is None:
+        return None
+    try:
+        args = tuple(sim_values[a] for a in bool_expr.arg_names)
+    except KeyError:
+        return None
+    try:
+        out = bf.func(*args)
+    except Exception:
+        return None
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    return bool(out)
+
+
+def _simulate_block_until(block: BlockNode, target_idx: int, sim_values: dict,
+                          known_funcs: dict, known_bools: dict | None = None) -> bool:
     """Simulate `block.statements[0..target_idx-1]` in place on sim_values.
-    Returns True on success, False if any statement fails (KeyError or wrong
-    output count). Only handles FunctionCallAssign and DirectAssign for now —
-    if/else and nested while at top level pre-loop aren't supported here.
+    Returns True on success, False if any statement fails. Handles
+    FunctionCallAssign, DirectAssign, IfElseNode (evaluates the condition and
+    recurses into the chosen branch), and WhileNode (iterates until condition
+    is false). Returns False on any unevaluable condition or runtime error.
     """
     for stmt in block.statements[:target_idx]:
         if isinstance(stmt, FunctionCallAssignNode):
@@ -220,12 +246,31 @@ def _simulate_block_until(block: BlockNode, target_idx: int, sim_values: dict, k
                 sim_values.pop(s, None)
             for t, v in zip(stmt.target_vars, src_vals):
                 sim_values[t] = v
+        elif isinstance(stmt, IfElseNode):
+            cond = _eval_bool_expr(stmt.bool_expr, sim_values, known_bools)
+            if cond is None:
+                return False
+            chosen = stmt.if_block if cond else stmt.else_block
+            if not _simulate_block_until(chosen, len(chosen.statements), sim_values, known_funcs, known_bools):
+                return False
+        elif isinstance(stmt, WhileNode):
+            for _ in range(1000):
+                cond = _eval_bool_expr(stmt.bool_expr, sim_values, known_bools)
+                if cond is None:
+                    return False
+                if not cond:
+                    break
+                if not _simulate_block_until(stmt.block, len(stmt.block.statements), sim_values, known_funcs, known_bools):
+                    return False
+            else:
+                return False  # didn't terminate
         else:
-            return False  # bail on other top-level constructs for now
+            return False
     return True
 
 
-def _simulate_while_iterations(body: BlockNode, sim_values: dict, known_funcs: dict, max_iters: int = 1000):
+def _simulate_while_iterations(body: BlockNode, sim_values: dict, known_funcs: dict,
+                               known_bools: dict | None = None, max_iters: int = 1000):
     """Run the while body iteration by iteration on sim_values, recording each
     iteration's pre-iteration state as an "entry". Stop when the body fails
     to run (would crash on next iteration); record that failure-triggering
@@ -237,7 +282,7 @@ def _simulate_while_iterations(body: BlockNode, sim_values: dict, known_funcs: d
         before = dict(sim_values)
         # Run a copy of body on sim_values; if it fails, this iteration is the skip.
         trial = dict(sim_values)
-        ok = _simulate_block_until(body, len(body.statements), trial, known_funcs)
+        ok = _simulate_block_until(body, len(body.statements), trial, known_funcs, known_bools)
         if not ok:
             return entries, before  # body would fail → exit before this iteration
         entries.append(before)
@@ -252,6 +297,7 @@ def extract_while_conditional_problem_for_group(
     traces: list[SimpleCompEnv],
     known_funcs: dict,
     input_var_states: list[dict[str, "ObjId"]],
+    known_bools: dict | None = None,
 ) -> tuple[Problem | None, list[str]]:
     """Build a flat boolean-learning Problem for a while loop's condition by
     simulating the program forward for each trace from its initial inputs.
@@ -280,9 +326,9 @@ def extract_while_conditional_problem_for_group(
 
     for trace, init_state in zip(traces, input_var_states):
         sim_values = {k: trace.objects[v].value for k, v in init_state.items()}
-        if not _simulate_block_until(ast, while_idx, sim_values, known_funcs):
+        if not _simulate_block_until(ast, while_idx, sim_values, known_funcs, known_bools):
             continue
-        entries, skip = _simulate_while_iterations(body, sim_values, known_funcs)
+        entries, skip = _simulate_while_iterations(body, sim_values, known_funcs, known_bools)
         if skip is None:
             # Body would iterate forever — no condition can make this loop
             # terminate, so the program is invalid. Reject.

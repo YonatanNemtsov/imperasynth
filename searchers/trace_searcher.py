@@ -330,13 +330,11 @@ def find_possible_end_while_actions(
 
     rep = min(while_indices)
 
-    # Candidate targets: pre-loop names (not defined in body), in scope for all active traces.
     candidate_targets = [
         v for v in variable_states[rep].keys()
         if v not in body_var_names and all(v in variable_states[i] for i in while_indices)
     ]
 
-    # Candidate sources: body-defined names, in scope for all active traces.
     candidate_sources = [
         v for v in variable_states[rep].keys()
         if v in body_var_names and all(v in variable_states[i] for i in while_indices)

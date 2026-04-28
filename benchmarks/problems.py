@@ -83,8 +83,37 @@ def sum_of_list():
     return problem, funcs, bools
 
 
+def sum_of_evens():
+    """Sum only the even elements of a list. Needs a while loop with an
+    if/else inside its body — the condition gates whether each element is
+    accumulated."""
+    funcs = {
+        "add": Function(lambda x, y: (x + y,), [int, int], [int]),
+        "get_head": Function(lambda lst: ((lst[0],) if lst else ()), [tuple], [int]),
+        "get_tail": Function(lambda lst: ((lst[1:],) if lst else ((),)), [tuple], [tuple]),
+        "zero": Function(lambda: (0,), [], [int]),
+        "identity": Function(lambda x: (x,), [int], [int]),
+    }
+    bools = {
+        "is_empty": BoolFunction(lambda lst: ((len(lst) == 0,)), [tuple], [bool]),
+        "is_even": BoolFunction(lambda x: (x % 2 == 0,), [int], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
+    }
+    problem = Problem(
+        (tuple,), (int,),
+        instances={
+            0: (((2,),), (2,)),          # one even
+            1: (((1,),), (0,)),          # one odd
+            2: (((1, 2),), (2,)),        # mix, len 2
+            3: (((2, 3, 4),), (6,)),     # mix, len 3
+        },
+    )
+    return problem, funcs, bools
+
+
 ALL = {
     "max_of_two": max_of_two,
     "double_or_diff": double_or_diff,
     "sum_of_list": sum_of_list,
+    "sum_of_evens": sum_of_evens,
 }

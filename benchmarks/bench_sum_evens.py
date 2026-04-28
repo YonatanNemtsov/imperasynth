@@ -1,22 +1,29 @@
-"""Benchmark while-loop synthesis on sum-of-list, comparing from-scratch and
-seeded modes.
+"""Benchmark sum-of-evens: while-loop with an if/else inside the body.
 
-From-scratch: empty initial state, search must navigate to a while-shaped
-skeleton on its own. With the current heuristic this is currently expected
-to fail in any reasonable budget — the search prefers smaller-AST options
-that explore the if/else and func-call space first, and the while-loop
-branching factor is enormous.
+Target program shape:
+    x1 = zero();
+    while (not is_empty(x0)) {
+        x2 = get_head(x0);
+        x3 = get_tail(x0);
+        if (is_even(x2)) {
+            x4 = add(x1, x2);
+        } else {
+            x5 = identity(x1);
+        }
+        # end_else rebinds x5 <- x4 so x5 holds new acc on both sides
+        x0, x1 <- x3, x5;
+    }
+    return x1;
 
-Seeded: a hand-built partial state with the loop body already constructed.
-The search just has to navigate the execute phase + return + condition fill.
-
-This benchmark is a measuring stick: any future heuristic / pruning
-improvements should reduce the from-scratch step count toward the seeded
-count.
+Seed levels:
+  - "full":   everything above except the condition fill (Phase 3 finishes).
+  - "body":   body has x2=get_head and x3=get_tail; search must add the
+              if/else, the post-if/else rebind, end_while, execute, return.
+  - "tiny":   x1 = zero(); start_while applied. Empty body. Search builds it all.
 
 Run from v1/:
-    python3 benchmarks/bench_while_search.py
-    python3 benchmarks/bench_while_search.py --max-steps 200000
+    python3 benchmarks/bench_sum_evens.py
+    python3 benchmarks/bench_sum_evens.py --mode seeded --seed-level full --max-steps 50000
 """
 import argparse
 import contextlib
@@ -30,87 +37,128 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from core_lang_env.parser import ast_to_code_str
 from searchers.search_orchestrator import (
+    EndElseCandidate,
+    EndIfCandidate,
     EndWhileCandidate,
     FuncCallCandidate,
     SearchOrchestrator,
     SearchState,
+    StartIfCandidate,
     StartWhileCandidate,
 )
 
-from benchmarks.problems import sum_of_list
+from benchmarks.problems import sum_of_evens
 
 
 def _hdist(a, b):
     return abs(a - b) if isinstance(a, int) and isinstance(b, int) else 0
 
 
-def _build_sum_of_list_seed(problem, funcs, level: str = "full"):
-    """Hand-build a partial state at the requested level of detail.
+def _all_indices(state):
+    return tuple(range(len(state.trace_group.traces)))
 
-    Levels (each strictly less pre-built than the prev):
-      - "full":   x1 = zero(); start_while; full body; end_while with rebind.
-                  Search just navigates execute phase + return.
-      - "heavy":  x1 = zero(); start_while; full body (head + add + tail)
-                  but NO end_while. Search must pick the right rebinding
-                  pair (end_while), execute phase, return.
-      - "medium": x1 = zero(); start_while; only x2 = get_head(x0) in body.
-                  Search must finish the body + end_while + execute + return.
-      - "tiny":   x1 = zero(); start_while applied. Empty body.
-                  Search must build the entire body + end_while + execute + return.
-    """
+
+def _fc(state, var_action, output_length=1):
+    """Apply a FuncCallCandidate by spreading var_action across all live
+    traces (deriving each trace's short_action from its current variable_state).
+    var_action = (func_name, (input_var_names...))."""
+    fc_pos = state.aug_stack.peek()[0]
+    func_name, arg_names = var_action
+    short_actions = tuple(
+        (func_name, tuple(state.variable_states[i][a] for a in arg_names))
+        for i in range(len(state.trace_group.traces))
+    )
+    return state.apply_func_call_candidate(FuncCallCandidate(
+        fc_pos, _all_indices(state), var_action, short_actions, output_length,
+    ))
+
+
+def _build_seed(problem, funcs, level: str):
     state = SearchState.init_new_search_state_from_problem_and_funcs(problem, funcs)
 
-    # x1 = zero();
-    fc_pos = state.aug_stack.peek()[0]
-    state = state.apply_func_call_candidate(FuncCallCandidate(
-        fc_pos, (0, 1), ("zero", ()), (("zero", ()), ("zero", ())), 1,
-    ))
-    # start_while
+    # x1 = zero()
+    state = _fc(state, ("zero", ()))
+
+    # start_while — all traces enter (every input list is non-empty)
     sw_pos = state.aug_stack.peek()[0]
-    state = state.apply_start_while_candidate(StartWhileCandidate(sw_pos, (0, 1)))
+    state = state.apply_start_while_candidate(StartWhileCandidate(
+        sw_pos, _all_indices(state),
+    ))
 
     if level == "tiny":
         return state
 
-    # Body: x2 = get_head(x0)
-    fc_pos = state.aug_stack.peek()[0]
-    state = state.apply_func_call_candidate(FuncCallCandidate(
-        fc_pos, (0, 1), ("get_head", ("x0",)),
-        (("get_head", (state.variable_states[0]["x0"],)),
-         ("get_head", (state.variable_states[1]["x0"],))), 1,
-    ))
+    # body: x2 = get_head(x0)
+    state = _fc(state, ("get_head", ("x0",)))
+    # body: x3 = get_tail(x0)
+    state = _fc(state, ("get_tail", ("x0",)))
 
-    if level == "medium":
+    if level == "body":
         return state
 
-    # Body: x3 = add(x1, x2)
-    fc_pos = state.aug_stack.peek()[0]
-    state = state.apply_func_call_candidate(FuncCallCandidate(
-        fc_pos, (0, 1), ("add", ("x1", "x2")),
-        (("add", (state.variable_states[0]["x1"], state.variable_states[0]["x2"])),
-         ("add", (state.variable_states[1]["x1"], state.variable_states[1]["x2"]))), 1,
-    ))
-    # Body: x4 = get_tail(x0)
-    fc_pos = state.aug_stack.peek()[0]
-    state = state.apply_func_call_candidate(FuncCallCandidate(
-        fc_pos, (0, 1), ("get_tail", ("x0",)),
-        (("get_tail", (state.variable_states[0]["x0"],)),
-         ("get_tail", (state.variable_states[1]["x0"],))), 1,
+    # start_if — split traces by is_even(x2) on iter 1
+    instances = problem.instances
+    if_indices = []
+    else_indices = []
+    for i in range(len(state.trace_group.traces)):
+        first_elem = instances[i][0][0][0]   # ((lst,),) -> lst -> first item
+        (if_indices if first_elem % 2 == 0 else else_indices).append(i)
+    if_indices = tuple(if_indices)
+    else_indices = tuple(else_indices)
+
+    sif_pos = state.aug_stack.peek()[0]
+    state = state.apply_start_if_candidate(StartIfCandidate(
+        sif_pos, if_indices, else_indices,
     ))
 
-    if level == "heavy":
-        return state
+    # if-branch: x4 = add(x1, x2)
+    fc_pos = state.aug_stack.peek()[0]
+    short_actions = []
+    for i in range(len(state.trace_group.traces)):
+        if i in if_indices:
+            short_actions.append(("add", (state.variable_states[i]["x1"],
+                                          state.variable_states[i]["x2"])))
+        else:
+            short_actions.append("NO_ACTION")
+    state = state.apply_func_call_candidate(FuncCallCandidate(
+        fc_pos, if_indices, ("add", ("x1", "x2")),
+        tuple(short_actions), 1,
+    ))
 
-    # end_while with rebind x0 <- x4, x1 <- x3
+    # end_if
+    state = state.apply_end_if_candidate(EndIfCandidate(group_indices=if_indices))
+
+    # else-branch: x5 = identity(x1)
+    fc_pos = state.aug_stack.peek()[0]
+    short_actions = []
+    for i in range(len(state.trace_group.traces)):
+        if i in else_indices:
+            short_actions.append(("identity", (state.variable_states[i]["x1"],)))
+        else:
+            short_actions.append("NO_ACTION")
+    state = state.apply_func_call_candidate(FuncCallCandidate(
+        fc_pos, else_indices, ("identity", ("x1",)),
+        tuple(short_actions), 1,
+    ))
+
+    # end_else: target=if-defined, source=else-defined
+    # for else traces: set x4 (if-name) to point at x5 (else value).
+    # After this, x4 holds the new-acc value across all traces; x5 is dropped.
+    ee_pos = state.aug_stack.peek()[0]
+    state = state.apply_end_else_candidate(EndElseCandidate(
+        ee_pos, else_indices, target_vars=("x4",), source_vars=("x5",),
+    ))
+
+    # end_while: x0 <- x3, x1 <- x4
     ew_pos = state.aug_stack.peek()[0]
     state = state.apply_end_while_candidate(EndWhileCandidate(
-        ew_pos, (0, 1), target_vars=("x0", "x1"), source_vars=("x4", "x3"),
+        ew_pos, _all_indices(state),
+        target_vars=("x0", "x1"), source_vars=("x3", "x4"),
     ))
     return state
 
 
 def _queue_stats(orch):
-    """Snapshot queue size and ast_size (score[0]) distribution."""
     sizes = [score[0] for score, _ in list(orch.search_queue.queue)]
     if not sizes:
         return {"qsize": 0, "min_ast": None, "max_ast": None, "median_ast": None}
@@ -136,7 +184,7 @@ def run_search(problem, funcs, bools, *, seeded: bool, max_steps: int,
         orch.search_queue = PriorityQueue()
         orch.tie_counter = 0
         orch.visited_states = set()
-        orch.enqueue(_build_sum_of_list_seed(problem, funcs, level=seed_level))
+        orch.enqueue(_build_seed(problem, funcs, level=seed_level))
 
     checkpoints = sorted(checkpoints or [])
     cp_idx = 0
@@ -179,22 +227,6 @@ def report(label, orch, steps, elapsed, cp_log=None):
     print(f"  visited:            {len(orch.visited_states)}")
     print(f"  skeletons:          {len(orch.program_skeleton_candidates)}")
     print(f"  completed programs: {len(orch.completed_programs)}")
-
-    # Show a sample of queued while-containing states to see what they look like.
-    samples = []
-    for score, st in list(orch.search_queue.queue):
-        if _count(st.ast_group.ast, WhileNode) > 0:
-            samples.append((score, st))
-        if len(samples) >= 3:
-            break
-    if samples:
-        print(f"  sample queued while-states:")
-        for score, st in samples:
-            top = st.aug_stack.peek() if st.aug_stack.stack else None
-            top_opts = sorted(top[1]) if top else None
-            print(f"    score={score} stack_depth={len(st.aug_stack.stack)} top_opts={top_opts}")
-            for line in ast_to_code_str(st.ast_group.ast).splitlines():
-                print(f"      {line}")
     if cp_log:
         print(f"  checkpoints:")
         print(f"    {'step':>10}  {'time':>6}  {'qsize':>8}  {'min_ast':>8}  {'med_ast':>8}  {'max_ast':>8}")
@@ -213,19 +245,16 @@ def report(label, orch, steps, elapsed, cp_log=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["scratch", "seeded", "both"], default="both")
+    parser.add_argument("--mode", choices=["scratch", "seeded", "both"], default="seeded")
     parser.add_argument("--max-steps", type=int, default=50000)
-    parser.add_argument("--trace-length-limit", type=int, default=20)
-    parser.add_argument("--max-ast-len", type=int, default=30)
-    parser.add_argument("--max-while", type=int, default=None,
-                        help="Cap on number of WhileNodes in any explored AST.")
-    parser.add_argument("--max-if", type=int, default=None,
-                        help="Cap on number of IfElseNodes in any explored AST.")
-    parser.add_argument("--seed-level", choices=["tiny", "medium", "heavy", "full"], default="full",
-                        help="How much of the program is pre-built in the seed.")
+    parser.add_argument("--trace-length-limit", type=int, default=30)
+    parser.add_argument("--max-ast-len", type=int, default=40)
+    parser.add_argument("--max-while", type=int, default=None)
+    parser.add_argument("--max-if", type=int, default=None)
+    parser.add_argument("--seed-level", choices=["tiny", "body", "full"], default="full")
     args = parser.parse_args()
 
-    problem, funcs, bools = sum_of_list()
+    problem, funcs, bools = sum_of_evens()
 
     cps = sorted({n for n in (10000, 50000, 100000, 250000, 500000, 1_000_000)
                   if n <= args.max_steps})

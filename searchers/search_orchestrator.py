@@ -397,12 +397,12 @@ class SearchState:
         return ns
 
     def get_signature(self):
-        # Include each trace's action_history_short — the AnnotatedAST.signature
-        # used by ast_group.get_signature is frozen at build-phase end and
-        # doesn't capture execute-phase iteration counts. Two states differing
-        # only in how many while-iterations a trace took would otherwise dedupe
-        # to the same signature.
-        trace_sigs = tuple(tuple(t.action_history_short) for t in self.trace_group.traces)
+        # Use each trace's order-independent CompSignature (sorted multiset of
+        # short actions). The AnnotatedAST.signature used by ast_group is frozen
+        # at build-phase end so it doesn't capture execute-phase iteration counts;
+        # the trace signature does. Order-independence here also collapses
+        # build-phase permutations of independent body func_calls.
+        trace_sigs = tuple(t.signature.to_tuple() for t in self.trace_group.traces)
         return (hash(self.ast_group.get_signature()), hash(self.aug_stack.get_signature()), hash(trace_sigs))
 
 
@@ -512,9 +512,9 @@ def generate_start_while_candidates(state: SearchState, request: 'AugmentationRe
 
 
 def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequestEndWhile', cmaps: list[ComputationalMap]) -> list['EndWhileCandidate']:
-    """Close out a while loop. Requires (a) non-empty body and (b) at least one
-    valid rebinding pair (target_var <- source_var) — a while with no rebind
-    makes no progress per iteration so isn't a useful program."""
+    """Close out a while loop. Requires a non-empty body and a valid rebinding
+    pair. Filters out rebindings that leave any body-defined var unused
+    (dead computation), mirroring generate_end_else_candidates's check."""
     body_position = request.exec_position[0][:-1]
     body_block = state.ast_group.ast.get_node_at_position(body_position)
 
@@ -530,6 +530,12 @@ def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequ
         request.group_indices,
     )
 
+    unused_body_vars = set(get_unused_variables_in_ast(body_block))
+    filtered = [
+        (targets, sources) for targets, sources in rebinds
+        if unused_body_vars.issubset(set(sources))
+    ]
+
     return [
         EndWhileCandidate(
             exec_position=request.exec_position,
@@ -537,7 +543,7 @@ def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequ
             target_vars=target_vars,
             source_vars=source_vars,
         )
-        for target_vars, source_vars in rebinds
+        for target_vars, source_vars in filtered
     ]
 
 
@@ -584,7 +590,26 @@ def _can_trace_execute_while_body(state: SearchState, trace_idx: int, body: Bloc
                 sim_values.pop(s, None)
             for tgt, val in zip(child.target_vars, src_vals):
                 sim_values[tgt] = val
-        # else: optimistic for nested if/else/while
+        elif isinstance(child, IfElseNode):
+            # Optimistic for branch contents, but we DO need vars that survive
+            # past end_else — those are the else block's last DirectAssign
+            # target_vars (mirrors get_variables_defined_in_node). Without this,
+            # a downstream stmt that consumes the merged var fails the check.
+            else_block = child.else_block
+            if else_block.children:
+                final = else_block.children[-1]
+                if isinstance(final, DirectAssignNode):
+                    for tgt, src in zip(final.target_vars, final.source_vars):
+                        sim_values[tgt] = sim_values.get(src)
+        elif isinstance(child, WhileNode):
+            # Same idea for nested whiles: the body's last DirectAssign
+            # target_vars survive past end_while.
+            inner = child.block
+            if inner.children:
+                final = inner.children[-1]
+                if isinstance(final, DirectAssignNode):
+                    for tgt, src in zip(final.target_vars, final.source_vars):
+                        sim_values[tgt] = sim_values.get(src)
     return True
 
 
@@ -970,13 +995,14 @@ class SearchOrchestrator:
         traverse(search_state.ast_group.ast, ())
         return positions
 
-    def search_boolean_expression_while_node(self, search_state: SearchState, node_position: ASTNodePosition, max_depth=20):
+    def search_boolean_expression_while_node(self, search_state: SearchState, node_position: ASTNodePosition, max_depth=20, ast: BlockNode | None = None):
         bool_problem, input_vars = csr.extract_while_conditional_problem_for_group(
-            search_state.ast_group.ast,
+            ast if ast is not None else search_state.ast_group.ast,
             node_position,
             search_state.trace_group.traces,
             self.known_funcs,
             search_state.initial_vars,
+            self.known_bools,
         )
         if bool_problem is None or not bool_problem.instances:
             return None
@@ -1032,7 +1058,7 @@ class SearchOrchestrator:
         # while-node positions because if/else integration only replaces
         # bool_expr children at index 0, not statement-level structure.
         for pos in reversed(self.get_while_positions(search_state)):
-            stmts = self.search_boolean_expression_while_node(search_state, pos)
+            stmts = self.search_boolean_expression_while_node(search_state, pos, ast=full_ast)
             if not stmts:
                 print('bool expr not found (while)')
                 return None
