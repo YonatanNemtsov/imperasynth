@@ -496,8 +496,39 @@ def generate_func_call_candidates(state: SearchState, request: AugmentationReque
     ]
     return candidates
 
-def generate_start_if_candidates(state: SearchState, request: AugmentationRequestStartIf, cmaps: list[ComputationalMap]) -> list[StartIfCandidate]:
-    candidates = [StartIfCandidate(request.exec_position, if_indices, request.group_indices.difference(if_indices)) for if_indices in tsr.find_possible_start_if_actions(request.group_indices)]
+def generate_start_if_candidates(
+    state: SearchState,
+    request: AugmentationRequestStartIf,
+    cmaps: list[ComputationalMap],
+    realizable_fn=None,
+    max_depth: int = 2,
+) -> list[StartIfCandidate]:
+    """Build-phase if/else split — both branches must be non-empty (a dead
+    branch makes no sense at build time). With realizable_fn, restricts to
+    partitions some bool expression of depth ≤ max_depth can realize on the
+    active traces' in-scope values."""
+    group_indices = request.group_indices
+    if realizable_fn is None:
+        return [
+            StartIfCandidate(request.exec_position, if_indices, group_indices.difference(if_indices))
+            for if_indices in tsr.find_possible_start_if_actions(group_indices)
+        ]
+
+    active = sorted(group_indices)
+    in_scope = [
+        {var: state.trace_group.traces[i].objects[oid].value
+         for var, oid in state.variable_states[i].items()}
+        for i in active
+    ]
+    partitions = realizable_fn(in_scope, max_depth)
+    candidates = []
+    for local in partitions:
+        if_indices = frozenset(active[i] for i in local)
+        if not if_indices or if_indices == frozenset(active):
+            continue  # both branches must be non-empty
+        candidates.append(StartIfCandidate(
+            request.exec_position, if_indices, group_indices.difference(if_indices),
+        ))
     return candidates
 
 def generate_end_if_candidates(state: SearchState, request: AugmentationRequestEndIf, cmaps: list[ComputationalMap]) -> list[EndIfCandidate]:
@@ -791,27 +822,30 @@ class SearchOrchestrator:
         self.visited_states = set()
         self.tie_counter = 0
         self.last_processed_state = None
-        # Cache: (canonical per-trace values, max_depth) → {True-set: realizing stmts}.
-        self._partition_cache: dict = {}
+        # Shared across the orchestrator's lifetime; caches realizable
+        # partitions by per-trace value tuples (so different search states
+        # asking the same question hit the same entry).
+        self.bool_env = csr.BoolSearchEnvironment(known_funcs, known_bools, max_depth=2)
 
 
         # store completed programs (states with concluded search)
         self.program_skeleton_candidates: list[SearchState] = []
         self.completed_programs: list[SearchState] = []
 
-    def realizable_partitions(self, in_scope_values_per_trace: list[dict], max_depth: int) -> dict:
-        """Cached enumerate_realizable_partitions. Key uses canonical per-trace
-        (sorted name, value) tuples — same in-scope state across different
-        search states / paths gets the cached result."""
-        key = (
-            tuple(tuple(sorted(d.items())) for d in in_scope_values_per_trace),
-            max_depth,
+    def realizable_partitions(self, in_scope_values_per_trace: list[dict], max_depth: int = 2) -> dict:
+        """Caller-friendly wrapper around BoolSearchEnvironment. Pulls out
+        common in-scope vars, builds the value-tuple key, and delegates."""
+        if not in_scope_values_per_trace:
+            return {}
+        common_vars = set.intersection(*[set(d.keys()) for d in in_scope_values_per_trace])
+        if not common_vars:
+            return {}
+        var_names = sorted(common_vars)
+        value_tuples_per_input = tuple(
+            tuple(d[name] for d in in_scope_values_per_trace)
+            for name in var_names
         )
-        if key not in self._partition_cache:
-            self._partition_cache[key] = csr.enumerate_realizable_partitions(
-                in_scope_values_per_trace, self.known_funcs, self.known_bools, max_depth
-            )
-        return self._partition_cache[key]
+        return self.bool_env.realizable_partitions(value_tuples_per_input, var_names)
 
     # -----------------------------------------------------------------
     @staticmethod
@@ -871,7 +905,7 @@ class SearchOrchestrator:
             if isinstance(req, AugmentationRequestFuncCall):
                 candidates = generate_func_call_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestStartIf):
-                candidates = generate_start_if_candidates(state, req, self.cmaps)
+                candidates = generate_start_if_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestEndIf):
                 candidates = generate_end_if_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestEndElse):
