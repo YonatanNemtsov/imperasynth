@@ -572,7 +572,9 @@ class BoolSearchEnvironment:
         """value_tuples_per_input: tuple of length num_inputs. Each entry
         is a tuple of length n_traces giving the input's value in each trace.
         input_var_names: names assigned to each input in the realizing
-        expressions. Returns {frozenset[trace_idx]: list[stmts]}."""
+        expressions. Returns {frozenset[trace_idx]: (depth, list[stmts])}
+        — depth is the BFS depth at which the partition was first realized
+        (lower = simpler expression = better quality signal for the caller)."""
         cache_key = value_tuples_per_input
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -661,7 +663,7 @@ class BoolSearchEnvironment:
                         if out_type is bool:
                             true_set = frozenset(i for i, v in enumerate(out_vt) if v)
                             if true_set not in realizable:
-                                realizable[true_set] = _reconstruct_canonical(new_node_id, nodes, input_var_names)
+                                realizable[true_set] = (action_depth, _reconstruct_canonical(new_node_id, nodes, input_var_names))
             if not progressed:
                 break
 

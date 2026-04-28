@@ -235,8 +235,9 @@ def test_enumerate_realizable_partitions_sum_of_evens_iter1():
     assert frozenset({0, 2}) not in partitions
 
     # The realizing expression for {0, 3} must end in a BoolExprNode.
-    expr = partitions[frozenset({0, 3})]
-    assert isinstance(expr[-1], BoolExprNode)
+    depth, stmts = partitions[frozenset({0, 3})]
+    assert depth == 1, f"is_even(x2) is depth-1, got {depth}"
+    assert isinstance(stmts[-1], BoolExprNode)
 
 
 def test_enumerate_realizable_partitions_constants_present():

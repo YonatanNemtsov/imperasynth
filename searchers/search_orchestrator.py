@@ -93,6 +93,7 @@ class StartIfCandidate:
     exec_position: ExecutionPositionTuple
     if_indices: Tuple[int, ...]                 # may be empty (per your choice A)
     else_indices: Tuple[int, ...]               # may be empty
+    realizing_depth: int = 0                    # depth of bool expr that produces this partition
 
 @dataclass(slots=True)
 class EndIfCandidate:
@@ -110,6 +111,7 @@ class EndElseCandidate:
 class StartWhileCandidate:
     exec_position: ExecutionPositionTuple
     while_indices: Tuple[int, ...]   # traces that enter the loop body at least once
+    realizing_depth: int = 0
 
 @dataclass(slots=True)
 class EndWhileCandidate:
@@ -122,6 +124,7 @@ class EndWhileCandidate:
 class EnterWhileCandidate:
     exec_position: ExecutionPositionTuple
     while_indices: Tuple[int, ...]   # traces that take this iteration
+    realizing_depth: int = 0
 
 @dataclass(slots=True)
 class SkipWhileCandidate:
@@ -144,6 +147,7 @@ class ExecuteIfElseCandidate:
     exec_position: ExecutionPositionTuple
     if_indices: Tuple[int, ...]      # traces that took the if branch
     group_indices: Tuple[int, ...]   # all traces active at this if/else
+    realizing_depth: int = 0
 
 @dataclass(slots=True)
 class ExecuteDirectAssignCandidate:
@@ -156,14 +160,19 @@ class ExecuteDirectAssignCandidate:
 ################################### Search State #################################
 
 class SearchState:
-    def __init__(self, trace_group: tsr.TraceGroup, ast_group: asr.AnnotatedAstGroup, aug_stack: asr.AugmentationStack, initial_vars: list[dict[str, ObjId]], variable_states: list[dict[str, ObjId]], search_concluded: bool):
+    def __init__(self, trace_group: tsr.TraceGroup, ast_group: asr.AnnotatedAstGroup, aug_stack: asr.AugmentationStack, initial_vars: list[dict[str, ObjId]], variable_states: list[dict[str, ObjId]], search_concluded: bool, max_realizing_depth: int = 0):
         self.trace_group = trace_group
         self.ast_group = ast_group
         self.aug_stack = aug_stack
         self.initial_vars = initial_vars
         self.variable_states = variable_states
         self.search_concluded = search_concluded
-        
+        # Max BFS depth among realizing expressions chosen along this path.
+        # Updated by apply_*_candidate when the candidate carries a realizing
+        # depth (StartIf, ExecuteIfElse, StartWhile, EnterWhile). Used as a
+        # priority dimension in score_state.
+        self.max_realizing_depth = max_realizing_depth
+
 
     @staticmethod
     def init_new_search_state_from_problem_and_funcs(problem: Problem, known_funcs: dict[FunctionName, Function]):
@@ -173,10 +182,10 @@ class SearchState:
         aug_stack = asr.AugmentationStack.init_new_stack(set(i for i in range(len(problem.instances))))
         search_concluded = False
         return SearchState(trace_group, ast_group, aug_stack, initial_var_states.copy(), initial_var_states.copy(), search_concluded)
-    
+
     def copy(self):
         # shallow copies of structures that are already cloned internally
-        return SearchState(self.trace_group.copy(), self.ast_group.copy(), self.aug_stack.copy(), deepcopy(self.initial_vars), deepcopy(self.variable_states), self.search_concluded)
+        return SearchState(self.trace_group.copy(), self.ast_group.copy(), self.aug_stack.copy(), deepcopy(self.initial_vars), deepcopy(self.variable_states), self.search_concluded, self.max_realizing_depth)
 
     def __repr__(self):
         return f"SearchState(n_traces={len(self.trace_group.traces)}, ast={self.ast_group.ast})"
@@ -222,6 +231,7 @@ class SearchState:
 
         ns.ast_group = asr.apply_augmentation_start_if_group(ns.ast_group, cand.exec_position)
         ns.aug_stack.apply_transition(asr.AUG_START_IF, set(cand.if_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
 
         if not ns.aug_stack.stack:
             ns.search_concluded = True
@@ -270,6 +280,7 @@ class SearchState:
         ns = self.copy()
         ns.ast_group = asr.apply_augmentation_start_while_group(ns.ast_group, cand.exec_position)
         ns.aug_stack.apply_transition(asr.AUG_START_WHILE, set(cand.while_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
         return ns
@@ -309,6 +320,7 @@ class SearchState:
         when the body's execute_* candidates fire next."""
         ns = self.copy()
         ns.aug_stack.apply_transition(asr.AUG_ENTER_WHILE, set(cand.while_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
         return ns
@@ -379,6 +391,7 @@ class SearchState:
         traces that take it."""
         ns = self.copy()
         ns.aug_stack.apply_transition(asr.AUG_EXECUTE_IF_ELSE, set(cand.if_indices), None)
+        ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
         return ns
@@ -521,13 +534,16 @@ def generate_start_if_candidates(
         for i in active
     ]
     partitions = realizable_fn(in_scope, max_depth)
+    # Sort by realizing-expression depth (simpler first → enqueued first →
+    # smaller tie counter → popped first by score_state).
     candidates = []
-    for local in partitions:
+    for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0]):
         if_indices = frozenset(active[i] for i in local)
         if not if_indices or if_indices == frozenset(active):
             continue  # both branches must be non-empty
         candidates.append(StartIfCandidate(
             request.exec_position, if_indices, group_indices.difference(if_indices),
+            realizing_depth=depth,
         ))
     return candidates
 
@@ -562,11 +578,11 @@ def generate_start_while_candidates(
     ]
     partitions = realizable_fn(in_scope, max_depth)
     candidates = []
-    for local in partitions:
+    for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0]):
         if not local:
             continue  # empty subset = no traces enter = no while loop
         while_indices = tuple(sorted(active[i] for i in local))
-        candidates.append(StartWhileCandidate(request.exec_position, while_indices))
+        candidates.append(StartWhileCandidate(request.exec_position, while_indices, realizing_depth=depth))
     return candidates
 
 
@@ -669,11 +685,11 @@ def generate_enter_while_candidates(
     ]
     partitions = realizable_fn(in_scope, max_depth)
     candidates = []
-    for local in partitions:
+    for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0]):
         if not local:
             continue
         while_indices = tuple(sorted(active[i] for i in local))
-        candidates.append(EnterWhileCandidate(request.exec_position, while_indices))
+        candidates.append(EnterWhileCandidate(request.exec_position, while_indices, realizing_depth=depth))
     return candidates
 
 
@@ -717,11 +733,14 @@ def generate_execute_if_else_candidates(
         for i in active
     ]
     partitions = realizable_fn(in_scope, max_depth)
-    # Map local trace indices (positions in `active`) back to global indices.
-    if_index_sets = {frozenset(active[i] for i in local) for local in partitions}
     return [
-        ExecuteIfElseCandidate(request.exec_position, tuple(sorted(s)), tuple(sorted(group_indices)))
-        for s in if_index_sets
+        ExecuteIfElseCandidate(
+            request.exec_position,
+            tuple(sorted(active[i] for i in local)),
+            tuple(sorted(group_indices)),
+            realizing_depth=depth,
+        )
+        for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0])
     ]
 
 
@@ -846,18 +865,20 @@ def count_node_type(node: ASTNode, target_type) -> int:
 
 
 def score_state(state: SearchState, problem: Problem, cmaps: list["ComputationalMap"], tie_breaker: int):
-    """Priority key (lower → explored first).
+    """Priority key (lower → explored first), lex-compared.
 
-    Primary: ast_size (the actual program complexity). Stack depth is
-    intentionally NOT included — execute-phase operations swell the stack
-    but don't change the AST.
-    Secondary: importance_dist (estimated remaining work to reach targets).
-    Tertiary: tie_breaker (FIFO among equal-priority states).
+    1. ast_size — actual program complexity. Stack depth not included
+       (execute-phase swells the stack without changing the AST).
+    2. importance_dist — estimated remaining trace work to reach targets.
+    3. max_realizing_depth — max BFS depth among bool expressions chosen
+       along this path (StartIf/StartWhile/Enter/ExecuteIfElse). Lower =
+       simpler conditions = preferred. Updated by apply_*_candidate.
+    4. tie_breaker — FIFO among equal-priority states.
     """
     targets = [problem.instances[i][1][0] for i in range(len(problem.instances))]
     ast_size = compute_ast_size(state.ast_group.ast)
     importance_dist = estimate_final_trace_length(state, cmaps, targets)
-    return (ast_size, importance_dist, tie_breaker)
+    return (ast_size, importance_dist, state.max_realizing_depth, tie_breaker)
 
 
 ##################### Orchestrator ###################################
