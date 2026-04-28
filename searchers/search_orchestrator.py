@@ -281,22 +281,23 @@ class SearchState:
             ns.ast_group, cand.exec_position, cand.target_vars, cand.source_vars, set(cand.group_indices),
         )
 
-        if cand.target_vars:
-            # Apply the rebinding to active traces' variable_states.
-            # Pop sources first to handle swap-style assignments (a, b <- b, a).
-            for idx in cand.group_indices:
-                obj_ids = [ns.variable_states[idx].pop(src) for src in cand.source_vars]
-                for tgt, oid in zip(cand.target_vars, obj_ids):
-                    ns.variable_states[idx][tgt] = oid
+        # Apply rebinding for active traces. Pop sources first to handle
+        # swap-style assignments (a, b <- b, a).
+        for idx in cand.group_indices:
+            obj_ids = [ns.variable_states[idx].pop(src) for src in cand.source_vars]
+            for tgt, oid in zip(cand.target_vars, obj_ids):
+                ns.variable_states[idx][tgt] = oid
 
-            # Clean up body-defined variables that aren't kept as targets.
-            body_position = cand.exec_position[0][:-1]
-            variables_defined_in_body = get_variables_defined_in_node(ns.ast_group.ast, body_position)
-            for var in variables_defined_in_body:
-                if var not in cand.target_vars:
-                    for var_state in ns.variable_states:
-                        if var in var_state:
-                            del var_state[var]
+        # Clean up body-defined variables that aren't kept as rebinding targets.
+        # Body-scoped vars must not leak past the while boundary or downstream
+        # candidate generators would see vars that aren't actually in scope.
+        body_position = cand.exec_position[0][:-1]
+        variables_defined_in_body = get_variables_defined_in_node(ns.ast_group.ast, body_position)
+        for var in variables_defined_in_body:
+            if var not in cand.target_vars:
+                for var_state in ns.variable_states:
+                    if var in var_state:
+                        del var_state[var]
 
         ns.aug_stack.apply_transition(asr.AUG_END_WHILE, set(cand.group_indices), None)
         if not ns.aug_stack.stack:
@@ -313,9 +314,29 @@ class SearchState:
         return ns
 
     def apply_skip_while_candidate(self, cand: "SkipWhileCandidate") -> "SearchState":
-        """Stop iterating; traces leave the loop. No trace mutation here —
-        their state is whatever the last iteration left them."""
+        """Stop iterating; traces leave the loop.
+
+        The execute phase's apply_execute_func_call_candidate re-adds body-
+        defined vars to variable_states each iteration. On exit, those vars
+        leak into outer scope unless we clean them up here — same cleanup as
+        apply_end_while_candidate does for the build phase. The body's last
+        DirectAssign defines the variables that survive past the loop.
+        """
         ns = self.copy()
+
+        while_pos = cand.exec_position[0]
+        while_node = ns.ast_group.ast.get_node_at_position(while_pos)
+        if isinstance(while_node, WhileNode) and while_node.block.children:
+            last = while_node.block.children[-1]
+            target_vars = set(last.target_vars) if isinstance(last, DirectAssignNode) else set()
+            body_position = while_pos + (1,)
+            variables_defined_in_body = get_variables_defined_in_node(ns.ast_group.ast, body_position)
+            for var in variables_defined_in_body:
+                if var not in target_vars:
+                    for var_state in ns.variable_states:
+                        if var in var_state:
+                            del var_state[var]
+
         ns.aug_stack.apply_transition(asr.AUG_SKIP_WHILE, set(cand.group_indices), None)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
@@ -491,7 +512,15 @@ def generate_start_while_candidates(state: SearchState, request: 'AugmentationRe
 
 
 def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequestEndWhile', cmaps: list[ComputationalMap]) -> list['EndWhileCandidate']:
+    """Close out a while loop. Requires (a) non-empty body and (b) at least one
+    valid rebinding pair (target_var <- source_var) — a while with no rebind
+    makes no progress per iteration so isn't a useful program."""
     body_position = request.exec_position[0][:-1]
+    body_block = state.ast_group.ast.get_node_at_position(body_position)
+
+    if not body_block.children:
+        return []
+
     body_var_names = get_variables_defined_in_node(state.ast_group.ast, body_position)
 
     rebinds = tsr.find_possible_end_while_actions(
@@ -501,7 +530,7 @@ def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequ
         request.group_indices,
     )
 
-    candidates = [
+    return [
         EndWhileCandidate(
             exec_position=request.exec_position,
             group_indices=tuple(sorted(request.group_indices)),
@@ -510,13 +539,6 @@ def generate_end_while_candidates(state: SearchState, request: 'AugmentationRequ
         )
         for target_vars, source_vars in rebinds
     ]
-    # Always include the no-rebinding option for completeness; the search's
-    # heuristic will deprioritize loops with empty bodies/no rebinding.
-    candidates.append(EndWhileCandidate(
-        exec_position=request.exec_position,
-        group_indices=tuple(sorted(request.group_indices)),
-    ))
-    return candidates
 
 
 def _can_trace_execute_while_body(state: SearchState, trace_idx: int, body: BlockNode) -> bool:
@@ -717,14 +739,20 @@ def estimate_final_trace_length(state: SearchState, cmaps: list[ComputationalMap
     return max(estimates)
 
 
+def count_node_type(node: ASTNode, target_type) -> int:
+    """Count occurrences of `target_type` in the AST (recursively)."""
+    n = 1 if isinstance(node, target_type) else 0
+    for child in getattr(node, "children", []):
+        n += count_node_type(child, target_type)
+    return n
+
+
 def score_state(state: SearchState, problem: Problem, cmaps: list["ComputationalMap"], tie_breaker: int):
     """Priority key (lower → explored first).
 
-    Primary: ast_size (the actual program complexity — what the search is
-    trying to minimize). Stack depth is intentionally NOT included here:
-    execute-phase operations swell the stack but don't change the AST, so
-    penalizing stack depth would bury the only valid path through a while
-    loop's execute phase below SKIP-and-build alternatives.
+    Primary: ast_size (the actual program complexity). Stack depth is
+    intentionally NOT included — execute-phase operations swell the stack
+    but don't change the AST.
     Secondary: importance_dist (estimated remaining work to reach targets).
     Tertiary: tie_breaker (FIFO among equal-priority states).
     """
@@ -780,24 +808,31 @@ class SearchOrchestrator:
         self.search_queue.put((pr, state))
         self.tie_counter += 1
 
-    def step(self, trace_length_limit=None, max_ast_len=None) -> "SearchState | None":
+    def step(self, trace_length_limit=None, max_ast_len=None,
+             max_while: int | None = None, max_if: int | None = None) -> "SearchState | None":
         if self.search_queue.empty():
             return
 
         score, state = self.search_queue.get()
-        #sig = state.ast_group.get_signature()
-        #if sig in self.visited_states_signatures:
-        #    return state
-        
+
         # If this state is already solved, store it and return it.
         if state.search_concluded:
             self.program_skeleton_candidates.append(state)
             return state
-        
+
         if score[1] >= trace_length_limit:
             return state
 
         if score[0] > max_ast_len:
+            return state
+
+        # Control-flow budget: skip states whose AST already exceeds caller's
+        # while or if budget. Programs with more control flow than allowed are
+        # never expanded — the rest of the search continues exploring smaller
+        # control-flow programs first.
+        if max_while is not None and count_node_type(state.ast_group.ast, WhileNode) > max_while:
+            return state
+        if max_if is not None and count_node_type(state.ast_group.ast, IfElseNode) > max_if:
             return state
         
         requests = generate_augmentation_requests_from_state(state, self.cls_map)

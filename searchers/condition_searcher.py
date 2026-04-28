@@ -283,9 +283,12 @@ def extract_while_conditional_problem_for_group(
         if not _simulate_block_until(ast, while_idx, sim_values, known_funcs):
             continue
         entries, skip = _simulate_while_iterations(body, sim_values, known_funcs)
+        if skip is None:
+            # Body would iterate forever — no condition can make this loop
+            # terminate, so the program is invalid. Reject.
+            return None, []
         all_entries.extend(entries)
-        if skip is not None:
-            all_skips.append(skip)
+        all_skips.append(skip)
 
     if not all_entries and not all_skips:
         return None, []

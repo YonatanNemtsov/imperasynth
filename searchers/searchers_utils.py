@@ -844,13 +844,38 @@ def compute_block_hash(block: BlockNode, variable_hashes: dict[str, int]) -> int
             child_hashes.append(compute_direct_assign_hash(node, var_hashes))
             for i, target in enumerate(node.target_vars):
                 var_hashes[target] = compute_direct_assign_target_hash(i, node.source_vars[i], var_hashes)
-        
+
         elif isinstance(node, IfElseNode):
             if_hash, new_var_hashes = compute_if_else_hash(node, var_hashes)
             var_hashes = new_var_hashes
             child_hashes.append(if_hash)
-    
+
+        elif isinstance(node, WhileNode):
+            while_hash, new_var_hashes = compute_while_hash(node, var_hashes)
+            var_hashes = new_var_hashes
+            child_hashes.append(while_hash)
+
     return hash(tuple(sorted(child_hashes))), var_hashes
+
+
+def compute_while_hash(while_node: 'WhileNode', variable_hashes: dict[str, int]):
+    """Hash a WhileNode and propagate the body's terminating-rebind target_vars
+    out to the surrounding scope (those are the only body vars visible after
+    the loop). Body-internal vars (intermediate computations) stay scoped."""
+    var_hashes = variable_hashes.copy()
+    bool_expr_hash = compute_bool_expr_hash(while_node.bool_expr, var_hashes)
+    body_hash, body_var_hashes = compute_block_hash(while_node.block, var_hashes)
+
+    # Only the body's last DirectAssign target_vars survive past the loop —
+    # those are the rebind that end_while inserts.
+    if while_node.block.children:
+        final = while_node.block.children[-1]
+        if isinstance(final, DirectAssignNode):
+            for tgt in final.target_vars:
+                if tgt in body_var_hashes:
+                    var_hashes[tgt] = body_var_hashes[tgt]
+
+    return hash((bool_expr_hash, body_hash)), var_hashes
 
 def compute_if_else_hash(if_else: IfElseNode, variable_hashes: dict[str, int]):
     var_hashes = variable_hashes.copy()
