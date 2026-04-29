@@ -218,7 +218,8 @@ def execute_return_node(context: ExecutionContext, node: ReturnNode):
 
 
 class AnnotatedAST:
-    def __init__(self, ast: ASTNode, signature: CompSignature, mapping: dict[ShortAction, ExecutionPositionTuple], initial_vars: dict[str, ObjId]):
+    def __init__(self, ast: ASTNode, signature: CompSignature, mapping: dict[ShortAction, ExecutionPositionTuple], initial_vars: dict[str, ObjId],
+                 if_else_decisions: list = None, while_iter_decisions: list = None):
         self.ast = ast
         self.signature = signature
         self.mapping = mapping
@@ -228,11 +229,19 @@ class AnnotatedAST:
 
         self.action_node_positions = set()
         self.ast_node_pos_to_action = {}
-        
+
         for action, exec_position in mapping.items():
             self.action_node_positions.add(exec_position[0])
             self.ast_node_pos_to_action.setdefault(tuple(exec_position[0]), []).append(action)
             self.reverse_mapping[exec_position] = action
+
+        # Per-decision logs for control-flow conditions. Each entry is a
+        # tuple (exec_position, var_state_snapshot, branch_or_entered_bool).
+        # Populated by apply_*_candidate methods on SearchState (build AND
+        # execute phase). Phase 3 reads these directly to learn conditions
+        # without replaying or re-simulating.
+        self.if_else_decisions: list = if_else_decisions if if_else_decisions is not None else []
+        self.while_iter_decisions: list = while_iter_decisions if while_iter_decisions is not None else []
 
 
     def add_action(self, short_action: ShortAction, exec_position: ExecutionPositionTuple):
@@ -292,7 +301,14 @@ class AnnotatedAST:
         return AnnotatedAST(ast, CompSignature([]), dict(), initial_vars)
     
     def copy(self):
-        return AnnotatedAST(self.ast.copy(), self.signature.copy(), self.mapping.copy(), self.initial_vars.copy())
+        return AnnotatedAST(
+            self.ast.copy(),
+            self.signature.copy(),
+            self.mapping.copy(),
+            self.initial_vars.copy(),
+            list(self.if_else_decisions),
+            list(self.while_iter_decisions),
+        )
     
     def __repr__(self):
         return f"AnnotatedAST(history_len={len(self.mapping)})"

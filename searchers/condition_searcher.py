@@ -89,50 +89,45 @@ def extract_ifelse_conditional_problem(annotated_ast: AnnotatedAST, ifelse_node_
     return Problem(input_types, output_type, instances), var_names
 
 def extract_ifelse_conditional_problem_for_group(annotated_asts: list[AnnotatedAST], ifelse_node_position: ASTNodePosition, traces: list[SimpleCompEnv]) -> tuple[Problem | None, list[str]]:
-    """
-    Build one boolean-learning Problem from multiple annotated ASTs
-    and their corresponding traces.
+    """Build a bool-learning Problem from each trace's if_else_decisions log.
 
-    Returns:
-        (Problem or None, var_names)
+    Each entry in annot_ast.if_else_decisions is (exec_position, var_state,
+    took_if_branch). Filter to entries at this if/else position, build
+    True/False instances directly. Captures all iter-N branch choices the
+    search committed to during execute phase — not just iter-1 from the
+    AnnotatedAST mapping.
     """
-
     assert len(annotated_asts) == len(traces)
 
-    merged_problem = None
-    var_names = None
+    target_ast_pos = tuple(ifelse_node_position)
+    all_true: list[dict] = []
+    all_false: list[dict] = []
 
     for ann, trace in zip(annotated_asts, traces):
+        for exec_pos, var_state, took_if in ann.if_else_decisions:
+            if tuple(exec_pos[0]) != target_ast_pos:
+                continue
+            values = {k: trace.objects[oid].value for k, oid in var_state.items()}
+            (all_true if took_if else all_false).append(values)
 
-        result = extract_ifelse_conditional_problem(ann, ifelse_node_position, trace)
-
-        if result is None:
-            continue
-
-        sub_problem, sub_var_names = result
-
-        if merged_problem is None:
-            merged_problem = sub_problem
-            var_names = tuple(sub_var_names)
-            continue
-
-        if tuple(sub_var_names) != var_names:
-            continue
-
-        if sub_problem.input_types != merged_problem.input_types:
-            continue
-
-        if sub_problem.output_types != merged_problem.output_types:
-            continue
-
-        offset = len(merged_problem.instances)
-        for k, inst in sub_problem.instances.items():
-            merged_problem.instances[offset + k] = inst
-
-    if merged_problem is None:
+    if not all_true and not all_false:
         return None, []
 
-    return merged_problem, list(var_names)
+    all_states = all_true + all_false
+    var_names = sorted(set.intersection(*(set(s.keys()) for s in all_states)))
+    if not var_names:
+        return None, []
+
+    instances = {}
+    idx = 0
+    for state, label in [(s, True) for s in all_true] + [(s, False) for s in all_false]:
+        inputs = tuple(state[v] for v in var_names)
+        instances[idx] = (inputs, (label,))
+        idx += 1
+
+    sample_inputs, _ = next(iter(instances.values()))
+    input_types = tuple(type(x) for x in sample_inputs)
+    return Problem(input_types, bool, instances), var_names
 
 
 def extract_while_conditional_problem(annotated_ast: AnnotatedAST, while_node_position: ASTNodePosition, trace: SimpleCompEnv) -> Problem | None:
@@ -274,48 +269,38 @@ def extract_while_conditional_problem_for_group(
     known_funcs: dict,
     input_var_states: list[dict[str, "ObjId"]],
     known_bools: dict | None = None,
+    annot_asts: list = None,
 ) -> tuple[Problem | None, list[str]]:
-    """Build a flat boolean-learning Problem for a while loop's condition by
-    simulating the program forward for each trace from its initial inputs.
+    """Build a bool-learning Problem from each trace's while_iter_decisions log.
 
-    Walks the top-level block up to the while loop, then iterates the body
-    until it would fail. Each iteration's pre-iteration variable state is a
-    True instance; the failure-triggering state is the False instance.
-
-    Differs from `extract_while_conditional_problem`: doesn't read the
-    AnnotatedAST (which is frozen at build phase) — the simulation gives us
-    accurate execute-phase iteration data.
+    Each trace's annot_ast.while_iter_decisions is a list of (exec_position,
+    var_state_snapshot, entered_bool) entries — populated by apply_*_candidate
+    methods at start_while/enter_while/skip_while time. Filter to entries at
+    the requested while_node_position, build True/False instances directly.
+    No simulation, no replay — the search already committed to these decisions.
     """
     while_node = ast.get_node_at_position(while_node_position)
     if not isinstance(while_node, WhileNode):
         raise TypeError("Node at position is not a WhileNode")
 
-    # Only top-level while loops handled here — extend later for nested.
-    if len(while_node_position) != 1:
+    if annot_asts is None:
         return None, []
 
-    while_idx = while_node_position[0]
-    body = while_node.block
+    target_ast_pos = tuple(while_node_position)
 
     all_entries: list[dict] = []
     all_skips: list[dict] = []
 
-    for trace, init_state in zip(traces, input_var_states):
-        sim_values = {k: trace.objects[v].value for k, v in init_state.items()}
-        if not _simulate_block_until(ast, while_idx, sim_values, known_funcs, known_bools):
-            continue
-        entries, skip = _simulate_while_iterations(body, sim_values, known_funcs, known_bools)
-        if skip is None:
-            # Body would iterate forever — no condition can make this loop
-            # terminate, so the program is invalid. Reject.
-            return None, []
-        all_entries.extend(entries)
-        all_skips.append(skip)
+    for trace, annot in zip(traces, annot_asts):
+        for exec_pos, var_state, entered in annot.while_iter_decisions:
+            if tuple(exec_pos[0]) != target_ast_pos:
+                continue
+            values = {k: trace.objects[oid].value for k, oid in var_state.items()}
+            (all_entries if entered else all_skips).append(values)
 
     if not all_entries and not all_skips:
         return None, []
 
-    # Variable names: intersection of keys present in every entry/skip state.
     all_states = all_entries + all_skips
     var_names = sorted(set.intersection(*(set(s.keys()) for s in all_states)))
     if not var_names:

@@ -136,6 +136,38 @@ class SimpleMapper:
         else:
             print("Target was NOT discovered.")
 
+def expand_cmap_forward(cmap: 'ComputationalMap', levels: int = 1) -> 'ComputationalMap':
+    """Forward-expand `cmap` by `levels` rounds: for each round, apply every
+    function with type-compatible argument tuples drawn from cmap's current
+    objects, adding new outputs as objects/actions. Used to widen a minimal
+    cmap (build-phase pruning, restricted to path-to-target) into a runtime
+    cmap (execute-phase value validation, includes immediate consequences of
+    on-path values like `tail((2,)) → ()`). Returns a new cmap."""
+    expanded = ComputationalMap(
+        objects={k: set(v) for k, v in cmap.objects.items()},
+        functions=dict(cmap.functions),
+        actions=dict(cmap.actions),
+    )
+    for _ in range(levels):
+        objs_by_type: dict[type, list] = {}
+        for (t, v) in expanded.objects.keys():
+            objs_by_type.setdefault(t, []).append(v)
+        for func_name, func in list(expanded.functions.items()):
+            slots = [objs_by_type.get(t, []) for t in func.input_types]
+            if func.input_types and not all(slots):
+                continue
+            arg_combos = product(*slots) if func.input_types else [()]
+            for arg in arg_combos:
+                action_key = (func_name,) + tuple(arg)
+                if action_key in expanded.actions:
+                    continue
+                try:
+                    expanded.act(func_name, tuple(arg))
+                except Exception:
+                    continue
+    return expanded
+
+
 def extract_minimal_subgraph(comp_map, target_obj):
     minimal_map = ComputationalMap.init_empty_map()
     visited_objects = set()

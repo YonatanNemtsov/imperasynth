@@ -230,6 +230,12 @@ class SearchState:
         ns = self.copy()
 
         ns.ast_group = asr.apply_augmentation_start_if_group(ns.ast_group, cand.exec_position)
+        # Log per-trace if/else decision before transitioning the stack.
+        if_set = set(cand.if_indices)
+        for i in set(cand.if_indices) | set(cand.else_indices):
+            ns.ast_group.annot_asts[i].if_else_decisions.append(
+                (cand.exec_position, dict(ns.variable_states[i]), i in if_set)
+            )
         ns.aug_stack.apply_transition(asr.AUG_START_IF, set(cand.if_indices), None)
         ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
 
@@ -279,6 +285,15 @@ class SearchState:
     def apply_start_while_candidate(self, cand: "StartWhileCandidate") -> "SearchState":
         ns = self.copy()
         ns.ast_group = asr.apply_augmentation_start_while_group(ns.ast_group, cand.exec_position)
+        # Log per-trace while iter-1 decision: did the trace enter the loop?
+        # `parent_group` (group_indices of the executing_while_frontier's parent)
+        # is the full set of traces eligible at this start_while.
+        parent_group = self.aug_stack.peek()[3]
+        entered_set = set(cand.while_indices)
+        for i in parent_group:
+            ns.ast_group.annot_asts[i].while_iter_decisions.append(
+                (cand.exec_position, dict(ns.variable_states[i]), i in entered_set)
+            )
         ns.aug_stack.apply_transition(asr.AUG_START_WHILE, set(cand.while_indices), None)
         ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
@@ -319,6 +334,14 @@ class SearchState:
         """Take another iteration through the loop body. Trace state advances
         when the body's execute_* candidates fire next."""
         ns = self.copy()
+        # Log: traces in the previous-iter while_indices (= current frontier's
+        # group_indices) decide enter-or-skip here.
+        parent_group = self.aug_stack.peek()[3]
+        entered_set = set(cand.while_indices)
+        for i in parent_group:
+            ns.ast_group.annot_asts[i].while_iter_decisions.append(
+                (cand.exec_position, dict(ns.variable_states[i]), i in entered_set)
+            )
         ns.aug_stack.apply_transition(asr.AUG_ENTER_WHILE, set(cand.while_indices), None)
         ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
@@ -349,6 +372,11 @@ class SearchState:
                         if var in var_state:
                             del var_state[var]
 
+        # Log skip decision (entered=False) per active trace at this point.
+        for i in cand.group_indices:
+            ns.ast_group.annot_asts[i].while_iter_decisions.append(
+                (cand.exec_position, dict(ns.variable_states[i]), False)
+            )
         ns.aug_stack.apply_transition(asr.AUG_SKIP_WHILE, set(cand.group_indices), None)
         if not ns.aug_stack.stack:
             ns.search_concluded = True
@@ -390,6 +418,11 @@ class SearchState:
         the chosen branch's execute_block will advance the trace state on the
         traces that take it."""
         ns = self.copy()
+        if_set = set(cand.if_indices)
+        for i in cand.group_indices:
+            ns.ast_group.annot_asts[i].if_else_decisions.append(
+                (cand.exec_position, dict(ns.variable_states[i]), i in if_set)
+            )
         ns.aug_stack.apply_transition(asr.AUG_EXECUTE_IF_ELSE, set(cand.if_indices), None)
         ns.max_realizing_depth = max(ns.max_realizing_depth, cand.realizing_depth)
         if not ns.aug_stack.stack:
@@ -482,18 +515,30 @@ def generate_augmentation_requests_from_state(
 
 ################################### Candidate generation ########################
 
-def generate_func_call_candidates(state: SearchState, request: AugmentationRequestFuncCall, cmaps: list[ComputationalMap]) -> list[FuncCallCandidate]:
+def _is_inside_while_body(state: SearchState) -> bool:
+    """True iff any open aug_stack frame is a while's building frontier
+    (which uniquely has AUG_END_WHILE in its options). Covers nested
+    if/else inside the while body too — the while's frame stays on the
+    stack until end_while pops it."""
+    return any(asr.AUG_END_WHILE in frame[1] for frame in state.aug_stack.stack)
+
+
+def generate_func_call_candidates(state: SearchState, request: AugmentationRequestFuncCall, cmaps: list[ComputationalMap], runtime_cmaps: list[ComputationalMap] | None = None) -> list[FuncCallCandidate]:
     """
     Generate all possible function call candidates for the current search state,
     based on the current execution position and active trace indices.
     """
     traces = state.trace_group.traces
 
-    # 1. Get per-trace variable states right before this position
-    # variable_list = [annot_ast.get_variable_state_at_position(request.exec_position) for annot_ast in state.ast_group.annot_asts]
-    
-    # 3. Get all available actions and filter by active indices
-    aligned_actions = tsr.find_possible_actions(traces, cmaps, state.variable_states)
+    # Inside a while body, control-flow values like `tail((1,)) → ()` are
+    # needed but not on the minimal path to target. Use the wider runtime
+    # cmap there so they're enumerable. Outside while, minimal cmap keeps
+    # build-phase pruning tight (otherwise int-heavy spaces explode).
+    use_cmaps = cmaps
+    if runtime_cmaps is not None and _is_inside_while_body(state):
+        use_cmaps = runtime_cmaps
+
+    aligned_actions = tsr.find_possible_actions(traces, use_cmaps, state.variable_states)
     filtered = tsr.filter_actions_by_active_trace_indices(aligned_actions, request.group_indices)
 
     # 4. Construct candidates
@@ -704,7 +749,25 @@ def generate_execute_block_candidates(state: SearchState, request: 'Augmentation
     return [ExecuteBlockCandidate(request.exec_position, tuple(sorted(request.group_indices)), subnodes)]
 
 
-def generate_execute_func_call_candidates(state: SearchState, request: 'AugmentationRequestExecuteFuncCall', cmaps: list[ComputationalMap]) -> list['ExecuteFuncCallCandidate']:
+def generate_execute_func_call_candidates(state: SearchState, request: 'AugmentationRequestExecuteFuncCall', cmaps: list[ComputationalMap], runtime_cmaps: list[ComputationalMap] | None = None) -> list['ExecuteFuncCallCandidate']:
+    """Replay an already-built FuncCall on active traces. With runtime_cmaps,
+    pre-flight every produced (value_type, value) — must be in that trace's
+    runtime cmap. Outputs outside cmap mean the search wandered off the
+    reachable subgraph; emit no candidate."""
+    if runtime_cmaps is None:
+        return [ExecuteFuncCallCandidate(request.exec_position, tuple(sorted(request.group_indices)))]
+    func_call_node = state.ast_group.ast.get_node_at_position(request.exec_position[0])
+    func = state.trace_group.known_funcs[func_call_node.func_name]
+    for i in request.group_indices:
+        trace = state.trace_group.traces[i]
+        try:
+            input_ids = tuple(state.variable_states[i][arg] for arg in func_call_node.arg_names)
+            output_values = trace.try_run_function(func_call_node.func_name, input_ids)
+        except Exception:
+            return []
+        for out_val, out_type in zip(output_values, func.output_types):
+            if (out_type, out_val) not in runtime_cmaps[i].objects:
+                return []
     return [ExecuteFuncCallCandidate(request.exec_position, tuple(sorted(request.group_indices)))]
 
 
@@ -884,11 +947,17 @@ def score_state(state: SearchState, problem: Problem, cmaps: list["Computational
 ##################### Orchestrator ###################################
 
 class SearchOrchestrator:
-    def __init__(self, problem: Problem, known_funcs, known_bools, cmaps, enable_while_loops: bool = False):
+    def __init__(self, problem: Problem, known_funcs, known_bools, cmaps, enable_while_loops: bool = False, runtime_expand_levels: int = 1):
         self.problem = problem
         self.known_funcs = known_funcs
         self.known_bools = known_bools
         self.cmaps = cmaps
+        # Build-phase cmaps prune action enumeration (path-to-target only).
+        # Runtime cmaps widen each minimal cmap by `runtime_expand_levels`
+        # forward steps so execute-phase value checks accept immediate
+        # consequences of on-path values (e.g. `tail((2,)) → ()`) without
+        # the build-phase pruning becoming over-aggressive.
+        self.runtime_cmaps = [expand_cmap_forward(c, runtime_expand_levels) for c in cmaps]
         self.enable_while_loops = enable_while_loops
         self.cls_map = get_cls_map(enable_while_loops)
 
@@ -977,7 +1046,7 @@ class SearchOrchestrator:
 
         for req in requests:
             if isinstance(req, AugmentationRequestFuncCall):
-                candidates = generate_func_call_candidates(state, req, self.cmaps)
+                candidates = generate_func_call_candidates(state, req, self.cmaps, self.runtime_cmaps)
             elif isinstance(req, AugmentationRequestStartIf):
                 candidates = generate_start_if_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestEndIf):
@@ -995,7 +1064,7 @@ class SearchOrchestrator:
             elif isinstance(req, AugmentationRequestExecuteBlock):
                 candidates = generate_execute_block_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestExecuteFuncCall):
-                candidates = generate_execute_func_call_candidates(state, req, self.cmaps)
+                candidates = generate_execute_func_call_candidates(state, req, self.cmaps, self.runtime_cmaps)
             elif isinstance(req, AugmentationRequestExecuteIfElse):
                 candidates = generate_execute_if_else_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestExecuteDirectAssign):
@@ -1116,6 +1185,7 @@ class SearchOrchestrator:
             self.known_funcs,
             search_state.initial_vars,
             self.known_bools,
+            search_state.ast_group.annot_asts,
         )
         if bool_problem is None or not bool_problem.instances:
             return None
