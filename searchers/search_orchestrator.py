@@ -957,7 +957,7 @@ class SearchOrchestrator:
         # forward steps so execute-phase value checks accept immediate
         # consequences of on-path values (e.g. `tail((2,)) → ()`) without
         # the build-phase pruning becoming over-aggressive.
-        self.runtime_cmaps = [expand_cmap_forward(c, runtime_expand_levels) for c in cmaps]
+        self.runtime_cmaps = [expand_cmap_forward(c, runtime_expand_levels, all_funcs=known_funcs) for c in cmaps]
         self.enable_while_loops = enable_while_loops
         self.cls_map = get_cls_map(enable_while_loops)
 

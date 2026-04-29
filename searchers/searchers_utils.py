@@ -136,18 +136,28 @@ class SimpleMapper:
         else:
             print("Target was NOT discovered.")
 
-def expand_cmap_forward(cmap: 'ComputationalMap', levels: int = 1) -> 'ComputationalMap':
-    """Forward-expand `cmap` by `levels` rounds: for each round, apply every
-    function with type-compatible argument tuples drawn from cmap's current
-    objects, adding new outputs as objects/actions. Used to widen a minimal
-    cmap (build-phase pruning, restricted to path-to-target) into a runtime
-    cmap (execute-phase value validation, includes immediate consequences of
-    on-path values like `tail((2,)) → ()`). Returns a new cmap."""
+def expand_cmap_forward(cmap: 'ComputationalMap', levels: int = 1, all_funcs: dict = None) -> 'ComputationalMap':
+    """Forward-expand `cmap` by `levels` rounds: each round applies every
+    function with type-compatible argument tuples drawn from current
+    objects, adding new outputs. Widens a minimal cmap (path-to-target
+    only) into a runtime cmap including immediate consequences of on-path
+    values like `tail((2,)) → ()`.
+
+    If `all_funcs` is provided, expansion uses that full function set —
+    important when the minimal cmap omits functions whose actions aren't
+    on path (e.g. `tail` when target is reached without it). Without it,
+    expansion is constrained to functions already in cmap.functions,
+    which defeats the purpose for any trace whose target needs a different
+    function set than the build-phase path used."""
     expanded = ComputationalMap(
         objects={k: set(v) for k, v in cmap.objects.items()},
         functions=dict(cmap.functions),
         actions=dict(cmap.actions),
     )
+    if all_funcs is not None:
+        for name, func in all_funcs.items():
+            if name not in expanded.functions:
+                expanded.functions[name] = func
     for _ in range(levels):
         objs_by_type: dict[type, list] = {}
         for (t, v) in expanded.objects.keys():
