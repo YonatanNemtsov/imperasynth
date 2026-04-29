@@ -89,50 +89,45 @@ def extract_ifelse_conditional_problem(annotated_ast: AnnotatedAST, ifelse_node_
     return Problem(input_types, output_type, instances), var_names
 
 def extract_ifelse_conditional_problem_for_group(annotated_asts: list[AnnotatedAST], ifelse_node_position: ASTNodePosition, traces: list[SimpleCompEnv]) -> tuple[Problem | None, list[str]]:
-    """
-    Build one boolean-learning Problem from multiple annotated ASTs
-    and their corresponding traces.
+    """Build a bool-learning Problem from each trace's if_else_decisions log.
 
-    Returns:
-        (Problem or None, var_names)
+    Each entry in annot_ast.if_else_decisions is (exec_position, var_state,
+    took_if_branch). Filter to entries at this if/else position, build
+    True/False instances directly. Captures all iter-N branch choices the
+    search committed to during execute phase — not just iter-1 from the
+    AnnotatedAST mapping.
     """
-
     assert len(annotated_asts) == len(traces)
 
-    merged_problem = None
-    var_names = None
+    target_ast_pos = tuple(ifelse_node_position)
+    all_true: list[dict] = []
+    all_false: list[dict] = []
 
     for ann, trace in zip(annotated_asts, traces):
+        for exec_pos, var_state, took_if in ann.if_else_decisions:
+            if tuple(exec_pos[0]) != target_ast_pos:
+                continue
+            values = {k: trace.objects[oid].value for k, oid in var_state.items()}
+            (all_true if took_if else all_false).append(values)
 
-        result = extract_ifelse_conditional_problem(ann, ifelse_node_position, trace)
-
-        if result is None:
-            continue
-
-        sub_problem, sub_var_names = result
-
-        if merged_problem is None:
-            merged_problem = sub_problem
-            var_names = tuple(sub_var_names)
-            continue
-
-        if tuple(sub_var_names) != var_names:
-            continue
-
-        if sub_problem.input_types != merged_problem.input_types:
-            continue
-
-        if sub_problem.output_types != merged_problem.output_types:
-            continue
-
-        offset = len(merged_problem.instances)
-        for k, inst in sub_problem.instances.items():
-            merged_problem.instances[offset + k] = inst
-
-    if merged_problem is None:
+    if not all_true and not all_false:
         return None, []
 
-    return merged_problem, list(var_names)
+    all_states = all_true + all_false
+    var_names = sorted(set.intersection(*(set(s.keys()) for s in all_states)))
+    if not var_names:
+        return None, []
+
+    instances = {}
+    idx = 0
+    for state, label in [(s, True) for s in all_true] + [(s, False) for s in all_false]:
+        inputs = tuple(state[v] for v in var_names)
+        instances[idx] = (inputs, (label,))
+        idx += 1
+
+    sample_inputs, _ = next(iter(instances.values()))
+    input_types = tuple(type(x) for x in sample_inputs)
+    return Problem(input_types, bool, instances), var_names
 
 
 def extract_while_conditional_problem(annotated_ast: AnnotatedAST, while_node_position: ASTNodePosition, trace: SimpleCompEnv) -> Problem | None:
