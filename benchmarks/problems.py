@@ -132,6 +132,7 @@ def predecessor():
         instances={
             0: ((3, 0), (2,)),
             1: ((5, 0), (4,)),
+            2: ((10, 0), (9,)),
         },
     )
     return problem, funcs, bools
