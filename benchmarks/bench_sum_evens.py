@@ -172,7 +172,7 @@ def _queue_stats(orch):
 
 
 def run_search(problem, funcs, bools, *, seeded: bool, max_steps: int,
-               trace_length_limit: int, max_ast_len: int, map_size: int = 50,
+               trace_length_limit: int, max_ast_len: int, map_size: int = 500,
                checkpoints: list[int] | None = None,
                max_while: int | None = None, max_if: int | None = None,
                seed_level: str = "full"):

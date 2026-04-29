@@ -77,7 +77,7 @@ def sum_of_list():
         (tuple,), (int,),
         instances={
             0: (((1,),), (1,)),       # 1 iter
-            1: (((1, 2),), (3,)),     # 2 iters
+            1: (((3, 2),), (5,)),     # 2 iters
         },
     )
     return problem, funcs, bools
@@ -103,9 +103,9 @@ def sum_of_evens():
         (tuple,), (int,),
         instances={
             0: (((2,),), (2,)),          # one even
-            1: (((1,),), (0,)),          # one odd
-            2: (((1, 2),), (2,)),        # mix, len 2
-            3: (((2, 3, 4),), (6,)),     # mix, len 3
+            1: (((3,2),), (2,)),          # one odd
+            2: (((5, 2,4),), (6,)),        # mix, len 2
+            3: (((4, 6, 1),), (10,)),     # mix, len 3
         },
     )
     return problem, funcs, bools

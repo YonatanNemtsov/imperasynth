@@ -947,7 +947,7 @@ def score_state(state: SearchState, problem: Problem, cmaps: list["Computational
 ##################### Orchestrator ###################################
 
 class SearchOrchestrator:
-    def __init__(self, problem: Problem, known_funcs, known_bools, cmaps, enable_while_loops: bool = False, runtime_expand_levels: int = 1):
+    def __init__(self, problem: Problem, known_funcs, known_bools, cmaps, enable_while_loops: bool = False, runtime_expand_levels: int = 2):
         self.problem = problem
         self.known_funcs = known_funcs
         self.known_bools = known_bools
