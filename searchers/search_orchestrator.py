@@ -704,7 +704,25 @@ def generate_execute_block_candidates(state: SearchState, request: 'Augmentation
     return [ExecuteBlockCandidate(request.exec_position, tuple(sorted(request.group_indices)), subnodes)]
 
 
-def generate_execute_func_call_candidates(state: SearchState, request: 'AugmentationRequestExecuteFuncCall', cmaps: list[ComputationalMap]) -> list['ExecuteFuncCallCandidate']:
+def generate_execute_func_call_candidates(state: SearchState, request: 'AugmentationRequestExecuteFuncCall', cmaps: list[ComputationalMap], runtime_cmaps: list[ComputationalMap] | None = None) -> list['ExecuteFuncCallCandidate']:
+    """Replay an already-built FuncCall on active traces. With runtime_cmaps,
+    pre-flight every produced (value_type, value) — must be in that trace's
+    runtime cmap. Outputs outside cmap mean the search wandered off the
+    reachable subgraph; emit no candidate."""
+    if runtime_cmaps is None:
+        return [ExecuteFuncCallCandidate(request.exec_position, tuple(sorted(request.group_indices)))]
+    func_call_node = state.ast_group.ast.get_node_at_position(request.exec_position[0])
+    func = state.trace_group.known_funcs[func_call_node.func_name]
+    for i in request.group_indices:
+        trace = state.trace_group.traces[i]
+        try:
+            input_ids = tuple(state.variable_states[i][arg] for arg in func_call_node.arg_names)
+            output_values = trace.try_run_function(func_call_node.func_name, input_ids)
+        except Exception:
+            return []
+        for out_val, out_type in zip(output_values, func.output_types):
+            if (out_type, out_val) not in runtime_cmaps[i].objects:
+                return []
     return [ExecuteFuncCallCandidate(request.exec_position, tuple(sorted(request.group_indices)))]
 
 
@@ -884,11 +902,17 @@ def score_state(state: SearchState, problem: Problem, cmaps: list["Computational
 ##################### Orchestrator ###################################
 
 class SearchOrchestrator:
-    def __init__(self, problem: Problem, known_funcs, known_bools, cmaps, enable_while_loops: bool = False):
+    def __init__(self, problem: Problem, known_funcs, known_bools, cmaps, enable_while_loops: bool = False, runtime_expand_levels: int = 2):
         self.problem = problem
         self.known_funcs = known_funcs
         self.known_bools = known_bools
         self.cmaps = cmaps
+        # Build-phase cmaps prune action enumeration (path-to-target only).
+        # Runtime cmaps widen each minimal cmap by `runtime_expand_levels`
+        # forward steps so execute-phase value checks accept immediate
+        # consequences of on-path values (e.g. `tail((2,)) → ()`) without
+        # the build-phase pruning becoming over-aggressive.
+        self.runtime_cmaps = [expand_cmap_forward(c, runtime_expand_levels) for c in cmaps]
         self.enable_while_loops = enable_while_loops
         self.cls_map = get_cls_map(enable_while_loops)
 
@@ -995,7 +1019,7 @@ class SearchOrchestrator:
             elif isinstance(req, AugmentationRequestExecuteBlock):
                 candidates = generate_execute_block_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestExecuteFuncCall):
-                candidates = generate_execute_func_call_candidates(state, req, self.cmaps)
+                candidates = generate_execute_func_call_candidates(state, req, self.cmaps, self.runtime_cmaps)
             elif isinstance(req, AugmentationRequestExecuteIfElse):
                 candidates = generate_execute_if_else_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestExecuteDirectAssign):
