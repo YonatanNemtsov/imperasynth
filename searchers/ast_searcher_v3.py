@@ -350,11 +350,11 @@ def augment_ast_return(ast: BlockNode, insertion_pos: ASTNodePosition, return_va
 
 def apply_augmentation_no_action(annotated_ast: AnnotatedAST, new_ast: BlockNode, exec_position: ExecutionPositionTuple, no_action: ShortAction) -> AnnotatedAST:
     assert no_action == NO_ACTION
-    return AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy())
+    return AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy(), list(annotated_ast.if_else_decisions), list(annotated_ast.while_iter_decisions))
 
 def apply_augmentation_return(annotated_ast: AnnotatedAST, new_ast: BlockNode, exec_position: ExecutionPositionTuple, return_action: ShortAction) -> AnnotatedAST:
     assert return_action[0] == RETURN_FUNC_NAME
-    new_annot_ast = AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy())
+    new_annot_ast = AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy(), list(annotated_ast.if_else_decisions), list(annotated_ast.while_iter_decisions))
     new_annot_ast.add_action(return_action, exec_position)
     return new_annot_ast
 
@@ -380,7 +380,7 @@ def augment_ast_function_call(ast: BlockNode, initial_vars: set[str], insertion_
     return new_ast
 
 def apply_augmentation_function_call(annotated_ast: AnnotatedAST, new_ast: ASTNode, exec_position: ExecutionPositionTuple, short_action: ShortAction) -> AnnotatedAST:
-    new_annot_ast = AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy())
+    new_annot_ast = AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy(), list(annotated_ast.if_else_decisions), list(annotated_ast.while_iter_decisions))
     new_annot_ast.add_action(short_action, exec_position)
     return new_annot_ast
 
@@ -420,13 +420,13 @@ def augment_ast_end_else(ast: BlockNode, insertion_pos: ASTNodePosition, target_
     return new_ast
 
 def apply_augmentation_if_start_end(annotated_ast: AnnotatedAST, new_ast: BlockNode) -> AnnotatedAST:
-    return AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy())
+    return AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy(), list(annotated_ast.if_else_decisions), list(annotated_ast.while_iter_decisions))
 
 def apply_augmentation_else_start(annotated_ast: AnnotatedAST, new_ast: BlockNode) -> AnnotatedAST:
-    return AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy())
+    return AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy(), list(annotated_ast.if_else_decisions), list(annotated_ast.while_iter_decisions))
 
 def apply_augmentation_else_end(annotated_ast: AnnotatedAST, new_ast: BlockNode, exec_position: ExecutionPositionTuple, target_vars: tuple[str], source_vars: tuple[str]):
-    new_annot = AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy())
+    new_annot = AnnotatedAST(new_ast, annotated_ast.signature.copy(), annotated_ast.mapping.copy(), annotated_ast.initial_vars.copy(), list(annotated_ast.if_else_decisions), list(annotated_ast.while_iter_decisions))
     new_annot.add_action(('ASSIGN', (target_vars, source_vars, exec_position)), exec_position)
     return new_annot
 

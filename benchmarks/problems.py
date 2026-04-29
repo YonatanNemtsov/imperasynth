@@ -111,9 +111,36 @@ def sum_of_evens():
     return problem, funcs, bools
 
 
+def predecessor():
+    """Return x0 - 1 given x0 (int) and x1 = 0. Tests while-loop synthesis
+    where the body is trivial (single succ + 1-target rebind). The condition
+    `not(eq(succ(x1), x0))` needs `succ` available *inside* the bool searcher
+    to compose helpers — so `succ` is included in the bools dict for this
+    benchmark (the BoolSearchEnvironment unions funcs+bools so this also
+    keeps it visible to search-time realizability)."""
+    succ_func = Function(lambda x: (x + 1,), [int], [int])
+    funcs = {
+        "succ": succ_func,
+    }
+    bools = {
+        "succ": succ_func,
+        "eq": BoolFunction(lambda x, y: (x == y,), [int, int], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
+    }
+    problem = Problem(
+        (int, int), (int,),
+        instances={
+            0: ((3, 0), (2,)),
+            1: ((5, 0), (4,)),
+        },
+    )
+    return problem, funcs, bools
+
+
 ALL = {
     "max_of_two": max_of_two,
     "double_or_diff": double_or_diff,
     "sum_of_list": sum_of_list,
     "sum_of_evens": sum_of_evens,
+    "predecessor": predecessor,
 }

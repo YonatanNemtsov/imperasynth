@@ -274,48 +274,38 @@ def extract_while_conditional_problem_for_group(
     known_funcs: dict,
     input_var_states: list[dict[str, "ObjId"]],
     known_bools: dict | None = None,
+    annot_asts: list = None,
 ) -> tuple[Problem | None, list[str]]:
-    """Build a flat boolean-learning Problem for a while loop's condition by
-    simulating the program forward for each trace from its initial inputs.
+    """Build a bool-learning Problem from each trace's while_iter_decisions log.
 
-    Walks the top-level block up to the while loop, then iterates the body
-    until it would fail. Each iteration's pre-iteration variable state is a
-    True instance; the failure-triggering state is the False instance.
-
-    Differs from `extract_while_conditional_problem`: doesn't read the
-    AnnotatedAST (which is frozen at build phase) — the simulation gives us
-    accurate execute-phase iteration data.
+    Each trace's annot_ast.while_iter_decisions is a list of (exec_position,
+    var_state_snapshot, entered_bool) entries — populated by apply_*_candidate
+    methods at start_while/enter_while/skip_while time. Filter to entries at
+    the requested while_node_position, build True/False instances directly.
+    No simulation, no replay — the search already committed to these decisions.
     """
     while_node = ast.get_node_at_position(while_node_position)
     if not isinstance(while_node, WhileNode):
         raise TypeError("Node at position is not a WhileNode")
 
-    # Only top-level while loops handled here — extend later for nested.
-    if len(while_node_position) != 1:
+    if annot_asts is None:
         return None, []
 
-    while_idx = while_node_position[0]
-    body = while_node.block
+    target_ast_pos = tuple(while_node_position)
 
     all_entries: list[dict] = []
     all_skips: list[dict] = []
 
-    for trace, init_state in zip(traces, input_var_states):
-        sim_values = {k: trace.objects[v].value for k, v in init_state.items()}
-        if not _simulate_block_until(ast, while_idx, sim_values, known_funcs, known_bools):
-            continue
-        entries, skip = _simulate_while_iterations(body, sim_values, known_funcs, known_bools)
-        if skip is None:
-            # Body would iterate forever — no condition can make this loop
-            # terminate, so the program is invalid. Reject.
-            return None, []
-        all_entries.extend(entries)
-        all_skips.append(skip)
+    for trace, annot in zip(traces, annot_asts):
+        for exec_pos, var_state, entered in annot.while_iter_decisions:
+            if tuple(exec_pos[0]) != target_ast_pos:
+                continue
+            values = {k: trace.objects[oid].value for k, oid in var_state.items()}
+            (all_entries if entered else all_skips).append(values)
 
     if not all_entries and not all_skips:
         return None, []
 
-    # Variable names: intersection of keys present in every entry/skip state.
     all_states = all_entries + all_skips
     var_names = sorted(set.intersection(*(set(s.keys()) for s in all_states)))
     if not var_names:
