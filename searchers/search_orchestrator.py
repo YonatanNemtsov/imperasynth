@@ -738,8 +738,39 @@ def generate_enter_while_candidates(
     return candidates
 
 
-def generate_skip_while_candidates(state: SearchState, request: 'AugmentationRequestSkipWhile', cmaps: list[ComputationalMap]) -> list['SkipWhileCandidate']:
-    return [SkipWhileCandidate(request.exec_position, tuple(sorted(request.group_indices)))]
+def generate_skip_while_candidates(
+    state: SearchState,
+    request: 'AugmentationRequestSkipWhile',
+    cmaps: list[ComputationalMap],
+    consistency_check=None,
+) -> list['SkipWhileCandidate']:
+    """SKIP exits the while loop. With `consistency_check`, additionally verify
+    the resulting iter pattern (accumulated while_iter_decisions for this
+    while + the skip about to be recorded) admits a uniform bool. Patterns
+    that no bool can fit get pruned at search time — avoids producing
+    skeletons Phase 3 would reject."""
+    cand = SkipWhileCandidate(request.exec_position, tuple(sorted(request.group_indices)))
+    if consistency_check is None:
+        return [cand]
+
+    while_pos = tuple(request.exec_position[0])
+    all_entries: list[dict] = []
+    all_skips: list[dict] = []
+    for trace, annot in zip(state.trace_group.traces, state.ast_group.annot_asts):
+        for exec_pos, var_state, entered in annot.while_iter_decisions:
+            if tuple(exec_pos[0]) != while_pos:
+                continue
+            values = {k: trace.objects[oid].value for k, oid in var_state.items()}
+            (all_entries if entered else all_skips).append(values)
+    # Add the would-be SKIP records (one per active trace).
+    for i in request.group_indices:
+        values = {k: state.trace_group.traces[i].objects[oid].value
+                  for k, oid in state.variable_states[i].items()}
+        all_skips.append(values)
+
+    if consistency_check(all_entries, all_skips):
+        return [cand]
+    return []
 
 
 def generate_execute_block_candidates(state: SearchState, request: 'AugmentationRequestExecuteBlock', cmaps: list[ComputationalMap]) -> list['ExecuteBlockCandidate']:
@@ -969,6 +1000,11 @@ class SearchOrchestrator:
         # partitions by per-trace value tuples (so different search states
         # asking the same question hit the same entry).
         self.bool_env = csr.BoolSearchEnvironment(known_funcs, known_bools, max_depth=2)
+        # Memoizes search_boolean_traces+create_bool_program_expressions
+        # results by (sorted instances tuple, var-name tuple, max_depth).
+        # Different search states querying the same bool problem (very
+        # common across skeletons sharing an if/else position) hit cache.
+        self._bool_search_cache: dict = {}
 
 
         # store completed programs (states with concluded search)
@@ -1004,14 +1040,19 @@ class SearchOrchestrator:
         orch = SearchOrchestrator(problem, known_funcs, known_bools, cmaps, enable_while_loops=enable_while_loops)
 
         # 4. enqueue initial state
-        pr = score_state(initial_state, problem, cmaps, orch.tie_counter)
+        pr = score_state(initial_state, problem, cmaps, -orch.tie_counter)
         orch.search_queue.put((pr, initial_state))
         orch.tie_counter += 1
 
         return orch
 
     def enqueue(self, state: "SearchState"):
-        pr = score_state(state, self.problem, self.cmaps, self.tie_counter)
+        # LIFO within ties: more recently enqueued state pops first when
+        # ast_size + dist + depth all match. Helps the search dive into
+        # promising shapes depth-first instead of jumping to siblings
+        # we expanded thousands of steps ago. Bad commits self-correct
+        # because the tied alternatives are still in the queue.
+        pr = score_state(state, self.problem, self.cmaps, -self.tie_counter)
         self.search_queue.put((pr, state))
         self.tie_counter += 1
 
@@ -1060,7 +1101,7 @@ class SearchOrchestrator:
             elif isinstance(req, AugmentationRequestEnterWhile):
                 candidates = generate_enter_while_candidates(state, req, self.cmaps, self.realizable_partitions)
             elif isinstance(req, AugmentationRequestSkipWhile):
-                candidates = generate_skip_while_candidates(state, req, self.cmaps)
+                candidates = generate_skip_while_candidates(state, req, self.cmaps, self.while_pattern_realizable)
             elif isinstance(req, AugmentationRequestExecuteBlock):
                 candidates = generate_execute_block_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestExecuteFuncCall):
@@ -1133,17 +1174,51 @@ class SearchOrchestrator:
 
         raise TypeError(f"Unrecognized candidate type: {type(cand)}")
     
+    def while_pattern_realizable(self, all_entries: list, all_skips: list, max_depth: int = 3) -> bool:
+        """Check whether the accumulated while iter decisions (entries True,
+        skips False) admit a uniform bool. Used at SKIP_WHILE candidate
+        generation to prune iter patterns that no bool can explain — avoids
+        producing skeletons that Phase 3 would reject."""
+        if not all_entries and not all_skips:
+            return True
+        all_states = all_entries + all_skips
+        common_vars = set.intersection(*(set(s.keys()) for s in all_states))
+        if not common_vars:
+            return False
+        var_names = sorted(common_vars)
+        instances = {}
+        idx = 0
+        for state_vals, label in [(s, True) for s in all_entries] + [(s, False) for s in all_skips]:
+            inputs = tuple(state_vals[v] for v in var_names)
+            instances[idx] = (inputs, (label,))
+            idx += 1
+        sample_inputs, _ = next(iter(instances.values()))
+        input_types = tuple(type(x) for x in sample_inputs)
+        bool_problem = Problem(input_types, bool, instances)
+        return self._cached_bool_search(bool_problem, var_names, max_depth) is not None
+
+    def _cached_bool_search(self, bool_problem, input_vars, max_depth):
+        """Run search_boolean_traces and extract expression, with memoization.
+        Cache key: (sorted instances tuple, var-name tuple, max_depth). Same
+        bool problem queried multiple times (e.g. across different skeletons
+        sharing the same if/else position) gets the cached expression."""
+        instance_items = tuple(sorted(bool_problem.instances.items()))
+        cache_key = (instance_items, tuple(input_vars), max_depth)
+        if cache_key in self._bool_search_cache:
+            return self._bool_search_cache[cache_key]
+        bool_trace_solution = csr.search_boolean_traces(bool_problem, self.known_bools, max_depth)
+        if any(trace.solution_object_id is None for trace in bool_trace_solution):
+            self._bool_search_cache[cache_key] = None
+            return None
+        statements = csr.create_bool_program_expressions(bool_trace_solution[0], input_vars)
+        self._bool_search_cache[cache_key] = statements
+        return statements
+
     def search_boolean_expression_ifelse_node(self, search_state: SearchState, node_position: ASTNodePosition, max_depth=20):
         bool_problem, input_vars = csr.extract_ifelse_conditional_problem_for_group(search_state.ast_group.annot_asts, node_position, search_state.trace_group.traces)
-        #funcs = self.known_bools.copy()
-        #funcs.update(self.known_funcs)
-        #print(funcs)
-        bool_trace_solution = csr.search_boolean_traces(bool_problem, self.known_bools, max_depth)
-        if any(trace.solution_object_id == None for trace in bool_trace_solution):
-            print('solution to bool problem not found')
+        if bool_problem is None:
             return None
-        boolean_expression_statements = csr.create_bool_program_expressions(bool_trace_solution[0], input_vars)
-        return boolean_expression_statements
+        return self._cached_bool_search(bool_problem, input_vars, max_depth)
 
     def integrate_boolean_expression_ifelse_node(self, ast: BlockNode, if_else_node_position: ASTNodePosition, boolean_expression_statements: list[ASTNode]):
         full_ast = ast.copy()
@@ -1189,10 +1264,7 @@ class SearchOrchestrator:
         )
         if bool_problem is None or not bool_problem.instances:
             return None
-        bool_trace_solution = csr.search_boolean_traces(bool_problem, self.known_bools, max_depth)
-        if any(t.solution_object_id is None for t in bool_trace_solution):
-            return None
-        return csr.create_bool_program_expressions(bool_trace_solution[0], input_vars)
+        return self._cached_bool_search(bool_problem, input_vars, max_depth)
 
     def integrate_boolean_expression_while_node(self, ast: BlockNode, while_node_position: ASTNodePosition, boolean_expression_statements: list[ASTNode]):
         """Splice a learned bool expression into a WhileNode's condition slot.
