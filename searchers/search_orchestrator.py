@@ -1040,14 +1040,19 @@ class SearchOrchestrator:
         orch = SearchOrchestrator(problem, known_funcs, known_bools, cmaps, enable_while_loops=enable_while_loops)
 
         # 4. enqueue initial state
-        pr = score_state(initial_state, problem, cmaps, orch.tie_counter)
+        pr = score_state(initial_state, problem, cmaps, -orch.tie_counter)
         orch.search_queue.put((pr, initial_state))
         orch.tie_counter += 1
 
         return orch
 
     def enqueue(self, state: "SearchState"):
-        pr = score_state(state, self.problem, self.cmaps, self.tie_counter)
+        # LIFO within ties: more recently enqueued state pops first when
+        # ast_size + dist + depth all match. Helps the search dive into
+        # promising shapes depth-first instead of jumping to siblings
+        # we expanded thousands of steps ago. Bad commits self-correct
+        # because the tied alternatives are still in the queue.
+        pr = score_state(state, self.problem, self.cmaps, -self.tie_counter)
         self.search_queue.put((pr, state))
         self.tie_counter += 1
 
