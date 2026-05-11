@@ -42,6 +42,7 @@ from searchers.search_orchestrator import (
 )
 
 from benchmarks.problems import predecessor
+from benchmarks._progress import print_progress
 
 
 def _hdist(a, b):
@@ -104,7 +105,8 @@ def run_search(problem, funcs, bools, *, seeded: bool, max_steps: int,
                trace_length_limit: int, max_ast_len: int, map_size: int = 50,
                checkpoints: list[int] | None = None,
                max_while: int | None = None, max_if: int | None = None,
-               seed_level: str = "full"):
+               seed_level: str = "full",
+               progress_every: int = 1000):
     with contextlib.redirect_stdout(io.StringIO()):
         orch = SearchOrchestrator.create_new_orchestrator_from_problem(
             problem, funcs, bools, _hdist, 50, map_size=map_size, enable_while_loops=True
@@ -134,6 +136,8 @@ def run_search(problem, funcs, bools, *, seeded: bool, max_steps: int,
         if cp_idx < len(checkpoints) and steps == checkpoints[cp_idx]:
             cp_log.append((steps, time.perf_counter() - t0, _queue_stats(orch)))
             cp_idx += 1
+        if progress_every and steps % progress_every == 0:
+            print_progress(orch, steps, t0)
         if orch.completed_programs:
             break
     elapsed = time.perf_counter() - t0
@@ -185,6 +189,8 @@ def main():
     parser.add_argument("--max-while", type=int, default=None)
     parser.add_argument("--max-if", type=int, default=None)
     parser.add_argument("--seed-level", choices=["tiny", "body", "full"], default="full")
+    parser.add_argument("--progress-every", type=int, default=1000,
+                        help="Print queue stats + sample queued AST every N steps. 0 disables.")
     args = parser.parse_args()
 
     problem, funcs, bools = predecessor()
@@ -200,6 +206,7 @@ def main():
             max_while=args.max_while, max_if=args.max_if,
             checkpoints=cps,
             seed_level=args.seed_level,
+            progress_every=args.progress_every,
         )
         report(f"SEEDED ({args.seed_level} seed)", orch, steps, elapsed, cp_log)
 
@@ -211,6 +218,7 @@ def main():
             max_ast_len=args.max_ast_len,
             max_while=args.max_while, max_if=args.max_if,
             checkpoints=cps,
+            progress_every=args.progress_every,
         )
         report("FROM-SCRATCH (empty initial AST)", orch, steps, elapsed, cp_log)
 
