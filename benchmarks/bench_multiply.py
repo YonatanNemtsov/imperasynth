@@ -1,29 +1,24 @@
-"""Benchmark sum-of-evens: while-loop with an if/else inside the body.
+"""Benchmark multiply: (a, b) -> a*b via repeated addition.
+
+Tests the interdependent bool search — the loop condition needs an INVENTED
+counter that doesn't exist in the problem inputs. The bool/scheme searcher
+should hypothesize:
+    init:    c0 = zero()
+    update:  c0 = succ(c0)
+    cond:    not(eq(c0, x1))
 
 Target program shape:
-    x1 = zero();
-    while (not is_empty(x0)) {
-        x2 = get_head(x0);
-        x3 = get_tail(x0);
-        if (is_even(x2)) {
-            x4 = add(x1, x2);
-        } else {
-            x5 = identity(x1);
-        }
-        # end_else rebinds x5 <- x4 so x5 holds new acc on both sides
-        x0, x1 <- x3, x5;
+    x2 = zero()
+    c0 = zero()
+    while (not(eq(c0, x1))) {
+        x3 = add(x2, x0)
+        x2 <- x3
+        c0 = succ(c0)
     }
-    return x1;
-
-Seed levels:
-  - "full":   everything above except the condition fill (Phase 3 finishes).
-  - "body":   body has x2=get_head and x3=get_tail; search must add the
-              if/else, the post-if/else rebind, end_while, execute, return.
-  - "tiny":   x1 = zero(); start_while applied. Empty body. Search builds it all.
+    return x2
 
 Run from v1/:
-    python3 benchmarks/bench_sum_evens.py
-    python3 benchmarks/bench_sum_evens.py --mode seeded --seed-level full --max-steps 50000
+    python3 benchmarks/bench_multiply.py --seed-level full
 """
 import argparse
 import contextlib
@@ -37,17 +32,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from core_lang_env.parser import ast_to_code_str
 from searchers.search_orchestrator import (
-    EndElseCandidate,
-    EndIfCandidate,
     EndWhileCandidate,
     FuncCallCandidate,
     SearchOrchestrator,
     SearchState,
-    StartIfCandidate,
     StartWhileCandidate,
 )
 
-from benchmarks.problems import sum_of_evens
+from benchmarks.problems import multiply
 from benchmarks._progress import print_progress
 
 
@@ -60,9 +52,6 @@ def _all_indices(state):
 
 
 def _fc(state, var_action, output_length=1):
-    """Apply a FuncCallCandidate by spreading var_action across all live
-    traces (deriving each trace's short_action from its current variable_state).
-    var_action = (func_name, (input_var_names...))."""
     fc_pos = state.aug_stack.peek()[0]
     func_name, arg_names = var_action
     short_actions = tuple(
@@ -74,13 +63,19 @@ def _fc(state, var_action, output_length=1):
     ))
 
 
-def _build_seed(problem, funcs, level: str):
+def _build_seed(problem, funcs, level: str = "full"):
+    """Levels:
+      - "full":  x2=zero(); start_while; x3=add(x2,x0); end_while x2<-x3.
+                 Search fills bool condition (interdependent search invents c0).
+      - "body":  x2=zero(); start_while; x3=add(x2,x0). Search adds end_while.
+      - "tiny":  x2=zero(); start_while. Search builds it all.
+    """
     state = SearchState.init_new_search_state_from_problem_and_funcs(problem, funcs)
 
-    # x1 = zero()
+    # x2 = zero()
     state = _fc(state, ("zero", ()))
 
-    # start_while — all traces enter (every input list is non-empty)
+    # start_while — all traces enter (b > 0 in all instances)
     sw_pos = state.aug_stack.peek()[0]
     state = state.apply_start_while_candidate(StartWhileCandidate(
         sw_pos, _all_indices(state),
@@ -89,72 +84,16 @@ def _build_seed(problem, funcs, level: str):
     if level == "tiny":
         return state
 
-    # body: x2 = get_head(x0)
-    state = _fc(state, ("get_head", ("x0",)))
-    # body: x3 = get_tail(x0)
-    state = _fc(state, ("get_tail", ("x0",)))
+    # x3 = add(x2, x0)
+    state = _fc(state, ("add", ("x2", "x0")))
 
     if level == "body":
         return state
 
-    # start_if — split traces by is_even(x2) on iter 1
-    instances = problem.instances
-    if_indices = []
-    else_indices = []
-    for i in range(len(state.trace_group.traces)):
-        first_elem = instances[i][0][0][0]   # ((lst,),) -> lst -> first item
-        (if_indices if first_elem % 2 == 0 else else_indices).append(i)
-    if_indices = tuple(if_indices)
-    else_indices = tuple(else_indices)
-
-    sif_pos = state.aug_stack.peek()[0]
-    state = state.apply_start_if_candidate(StartIfCandidate(
-        sif_pos, if_indices, else_indices,
-    ))
-
-    # if-branch: x4 = add(x1, x2)
-    fc_pos = state.aug_stack.peek()[0]
-    short_actions = []
-    for i in range(len(state.trace_group.traces)):
-        if i in if_indices:
-            short_actions.append(("add", (state.variable_states[i]["x1"],
-                                          state.variable_states[i]["x2"])))
-        else:
-            short_actions.append("NO_ACTION")
-    state = state.apply_func_call_candidate(FuncCallCandidate(
-        fc_pos, if_indices, ("add", ("x1", "x2")),
-        tuple(short_actions), 1,
-    ))
-
-    # end_if
-    state = state.apply_end_if_candidate(EndIfCandidate(group_indices=if_indices))
-
-    # else-branch: x5 = identity(x1)
-    fc_pos = state.aug_stack.peek()[0]
-    short_actions = []
-    for i in range(len(state.trace_group.traces)):
-        if i in else_indices:
-            short_actions.append(("identity", (state.variable_states[i]["x1"],)))
-        else:
-            short_actions.append("NO_ACTION")
-    state = state.apply_func_call_candidate(FuncCallCandidate(
-        fc_pos, else_indices, ("identity", ("x1",)),
-        tuple(short_actions), 1,
-    ))
-
-    # end_else: target=if-defined, source=else-defined
-    # for else traces: set x4 (if-name) to point at x5 (else value).
-    # After this, x4 holds the new-acc value across all traces; x5 is dropped.
-    ee_pos = state.aug_stack.peek()[0]
-    state = state.apply_end_else_candidate(EndElseCandidate(
-        ee_pos, else_indices, target_vars=("x4",), source_vars=("x5",),
-    ))
-
-    # end_while: x0 <- x3, x1 <- x4
+    # end_while: x2 <- x3
     ew_pos = state.aug_stack.peek()[0]
     state = state.apply_end_while_candidate(EndWhileCandidate(
-        ew_pos, _all_indices(state),
-        target_vars=("x0", "x1"), source_vars=("x3", "x4"),
+        ew_pos, _all_indices(state), target_vars=("x2",), source_vars=("x3",),
     ))
     return state
 
@@ -173,7 +112,7 @@ def _queue_stats(orch):
 
 
 def run_search(problem, funcs, bools, *, seeded: bool, max_steps: int,
-               trace_length_limit: int, max_ast_len: int, map_size: int = 500,
+               trace_length_limit: int, max_ast_len: int, map_size: int = 200,
                checkpoints: list[int] | None = None,
                max_while: int | None = None, max_if: int | None = None,
                seed_level: str = "full",
@@ -182,6 +121,10 @@ def run_search(problem, funcs, bools, *, seeded: bool, max_steps: int,
         orch = SearchOrchestrator.create_new_orchestrator_from_problem(
             problem, funcs, bools, _hdist, 50, map_size=map_size, enable_while_loops=True
         )
+    # Bool searcher needs to find `not(eq(c0, x1))` once c0 is augmented in.
+    # In BoolSearchEnvironment depth terms: eq(c0, x1) is depth 1 (two leaves),
+    # not(eq(c0, x1)) is depth 2.
+    orch.bool_env.max_depth = 2
     if seeded:
         orch.search_queue = PriorityQueue()
         orch.tie_counter = 0
@@ -252,18 +195,17 @@ def main():
     parser.add_argument("--mode", choices=["scratch", "seeded", "both"], default="seeded")
     parser.add_argument("--max-steps", type=int, default=50000)
     parser.add_argument("--trace-length-limit", type=int, default=30)
-    parser.add_argument("--max-ast-len", type=int, default=40)
+    parser.add_argument("--max-ast-len", type=int, default=30)
     parser.add_argument("--max-while", type=int, default=None)
     parser.add_argument("--max-if", type=int, default=None)
     parser.add_argument("--seed-level", choices=["tiny", "body", "full"], default="full")
     parser.add_argument("--progress-every", type=int, default=1000,
-                        help="Print queue stats + sample queued AST every N steps. 0 disables.")
+                        help="Print queue stats + a sample queued AST every N steps. 0 disables.")
     args = parser.parse_args()
 
-    problem, funcs, bools = sum_of_evens()
+    problem, funcs, bools = multiply()
 
-    cps = sorted({n for n in (10000, 50000, 100000, 250000, 500000, 1_000_000)
-                  if n <= args.max_steps})
+    cps = sorted({n for n in (10000, 50000, 100000, 250000) if n <= args.max_steps})
 
     if args.mode in ("seeded", "both"):
         orch, steps, elapsed, cp_log = run_search(

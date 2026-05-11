@@ -136,7 +136,8 @@ class SimpleMapper:
         else:
             print("Target was NOT discovered.")
 
-def expand_cmap_forward(cmap: 'ComputationalMap', levels: int = 1, all_funcs: dict = None) -> 'ComputationalMap':
+def expand_cmap_forward(cmap: 'ComputationalMap', levels: int = 1, all_funcs: dict = None,
+                        seed_objects: list = None) -> 'ComputationalMap':
     """Forward-expand `cmap` by `levels` rounds: each round applies every
     function with type-compatible argument tuples drawn from current
     objects, adding new outputs. Widens a minimal cmap (path-to-target
@@ -148,7 +149,13 @@ def expand_cmap_forward(cmap: 'ComputationalMap', levels: int = 1, all_funcs: di
     on path (e.g. `tail` when target is reached without it). Without it,
     expansion is constrained to functions already in cmap.functions,
     which defeats the purpose for any trace whose target needs a different
-    function set than the build-phase path used."""
+    function set than the build-phase path used.
+
+    If `seed_objects` is provided (list of (type, value)), those objects
+    are added to the expansion frontier before any function applications.
+    Necessary when the minimal-subgraph extraction prunes problem inputs
+    that aren't on the path-to-target — e.g. multiplication's x0=2 when
+    the build cmap reached target via x1+x1 instead of x0 repeatedly."""
     expanded = ComputationalMap(
         objects={k: set(v) for k, v in cmap.objects.items()},
         functions=dict(cmap.functions),
@@ -158,6 +165,10 @@ def expand_cmap_forward(cmap: 'ComputationalMap', levels: int = 1, all_funcs: di
         for name, func in all_funcs.items():
             if name not in expanded.functions:
                 expanded.functions[name] = func
+    if seed_objects is not None:
+        for (t, v) in seed_objects:
+            if (t, v) not in expanded.objects:
+                expanded.objects[(t, v)] = set()
     for _ in range(levels):
         objs_by_type: dict[type, list] = {}
         for (t, v) in expanded.objects.keys():
