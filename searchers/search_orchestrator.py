@@ -704,12 +704,18 @@ def generate_enter_while_candidates(
     cmaps: list[ComputationalMap],
     realizable_fn=None,
     max_depth: int = 2,
+    counter_augment: bool = False,
 ) -> list['EnterWhileCandidate']:
     """Execute-phase: which traces take another iteration. Two filters apply:
     (1) the body has to actually execute on the trace's current state (e.g.
     head-of-empty-list would crash); (2) with realizable_fn, the True-set
     has to match some bool expression on the active traces' in-scope values
-    — Phase 3 will pick that very expression as the while condition."""
+    — Phase 3 will pick that very expression as the while condition.
+
+    With counter_augment=True, also admits partitions realizable when each
+    trace's in-scope is augmented with a synthetic counter c0 = current iter
+    index. This admits counter-loop patterns the Phase-3 interdep search
+    will fill in (otherwise we'd prune them here)."""
     while_node = state.ast_group.ast.get_node_at_position(request.exec_position[0])
     body = while_node.block
     valid = {i for i in request.group_indices
@@ -728,7 +734,20 @@ def generate_enter_while_candidates(
          for var, oid in state.variable_states[i].items()}
         for i in active
     ]
-    partitions = realizable_fn(in_scope, max_depth)
+    partitions = dict(realizable_fn(in_scope, max_depth))
+    if counter_augment:
+        while_pos = tuple(request.exec_position[0])
+        iter_counts = [
+            sum(1 for ep, _, _ in state.ast_group.annot_asts[i].while_iter_decisions
+                if tuple(ep[0]) == while_pos)
+            for i in active
+        ]
+        counter_name = "_c0"
+        while any(counter_name in s for s in in_scope):
+            counter_name = "_" + counter_name
+        aug_scope = [dict(s, **{counter_name: iter_counts[i]}) for i, s in enumerate(in_scope)]
+        for k, v in realizable_fn(aug_scope, max_depth).items():
+            partitions.setdefault(k, v)
     candidates = []
     for local, (depth, _stmts) in sorted(partitions.items(), key=lambda kv: kv[1][0]):
         if not local:
@@ -756,19 +775,32 @@ def generate_skip_while_candidates(
     while_pos = tuple(request.exec_position[0])
     all_entries: list[dict] = []
     all_skips: list[dict] = []
-    for trace, annot in zip(state.trace_group.traces, state.ast_group.annot_asts):
+    per_trace_states: list = []
+    per_trace_labels: list = []
+    skip_set = set(request.group_indices)
+    for t_idx, (trace, annot) in enumerate(
+        zip(state.trace_group.traces, state.ast_group.annot_asts)):
+        st_t, lb_t = [], []
         for exec_pos, var_state, entered in annot.while_iter_decisions:
             if tuple(exec_pos[0]) != while_pos:
                 continue
             values = {k: trace.objects[oid].value for k, oid in var_state.items()}
             (all_entries if entered else all_skips).append(values)
-    # Add the would-be SKIP records (one per active trace).
-    for i in request.group_indices:
-        values = {k: state.trace_group.traces[i].objects[oid].value
-                  for k, oid in state.variable_states[i].items()}
-        all_skips.append(values)
+            st_t.append(values)
+            lb_t.append(bool(entered))
+        if t_idx in skip_set:
+            values = {k: state.trace_group.traces[t_idx].objects[oid].value
+                      for k, oid in state.variable_states[t_idx].items()}
+            all_skips.append(values)
+            st_t.append(values)
+            lb_t.append(False)
+        if st_t:
+            per_trace_states.append(st_t)
+            per_trace_labels.append(lb_t)
 
-    if consistency_check(all_entries, all_skips):
+    if consistency_check(all_entries, all_skips,
+                         per_trace_states=per_trace_states,
+                         per_trace_labels=per_trace_labels):
         return [cand]
     return []
 
@@ -922,7 +954,14 @@ def compute_ast_size(node: ASTNode, depth: int = 0) -> int:
     elif isinstance(node, WhileNode):
         base = 1
     elif isinstance(node, BlockNode):
-        base = 1
+        # Compromise: blocks contribute partial cost. With base = 1 (the original),
+        # an empty IfElse costs 3 vs a FuncCall's 1, so the search never tries
+        # if/else when func calls are available — sum_of_evens body never
+        # converged. With base = 0 the costs collapse to 1 each and if/else gets
+        # explored too aggressively. 0.5 keeps if/else slightly more expensive
+        # (empty IfElse = 2.0, While = 1.5, FuncCall = 1.0) which still allows
+        # if/else exploration in reasonable time without flooding.
+        base = 0.5
     else:
         base = 1
 
@@ -988,7 +1027,21 @@ class SearchOrchestrator:
         # forward steps so execute-phase value checks accept immediate
         # consequences of on-path values (e.g. `tail((2,)) → ()`) without
         # the build-phase pruning becoming over-aggressive.
-        self.runtime_cmaps = [expand_cmap_forward(c, runtime_expand_levels, all_funcs=known_funcs) for c in cmaps]
+        # Seed runtime cmap expansion with each instance's full input objects.
+        # The build-phase minimal-subgraph extraction may drop input objects
+        # whose value isn't on the path-to-target (e.g. multiply's x0=2 when
+        # target was reached via x1+x1). Without seeding, forward expansion
+        # never re-introduces them, and the body's `add(x_acc, x0)` produces
+        # values that runtime cmap doesn't recognize → execute rejected.
+        instance_input_seeds = [
+            [(t, v) for t, v in zip(problem.input_types, problem.instances[i][0])]
+            for i in range(len(problem.instances))
+        ]
+        self.runtime_cmaps = [
+            expand_cmap_forward(c, runtime_expand_levels, all_funcs=known_funcs,
+                                seed_objects=instance_input_seeds[i])
+            for i, c in enumerate(cmaps)
+        ]
         self.enable_while_loops = enable_while_loops
         self.cls_map = get_cls_map(enable_while_loops)
 
@@ -1005,6 +1058,7 @@ class SearchOrchestrator:
         # Different search states querying the same bool problem (very
         # common across skeletons sharing an if/else position) hit cache.
         self._bool_search_cache: dict = {}
+        self._interdep_cache: dict = {}
 
 
         # store completed programs (states with concluded search)
@@ -1099,7 +1153,10 @@ class SearchOrchestrator:
             elif isinstance(req, AugmentationRequestEndWhile):
                 candidates = generate_end_while_candidates(state, req, self.cmaps)
             elif isinstance(req, AugmentationRequestEnterWhile):
-                candidates = generate_enter_while_candidates(state, req, self.cmaps, self.realizable_partitions)
+                candidates = generate_enter_while_candidates(
+                    state, req, self.cmaps, self.realizable_partitions,
+                    counter_augment=True,
+                )
             elif isinstance(req, AugmentationRequestSkipWhile):
                 candidates = generate_skip_while_candidates(state, req, self.cmaps, self.while_pattern_realizable)
             elif isinstance(req, AugmentationRequestExecuteBlock):
@@ -1174,11 +1231,15 @@ class SearchOrchestrator:
 
         raise TypeError(f"Unrecognized candidate type: {type(cand)}")
     
-    def while_pattern_realizable(self, all_entries: list, all_skips: list, max_depth: int = 3) -> bool:
-        """Check whether the accumulated while iter decisions (entries True,
-        skips False) admit a uniform bool. Used at SKIP_WHILE candidate
-        generation to prune iter patterns that no bool can explain — avoids
-        producing skeletons that Phase 3 would reject."""
+    def while_pattern_realizable(self, all_entries: list, all_skips: list,
+                                  max_depth: int = 3,
+                                  per_trace_states: list | None = None,
+                                  per_trace_labels: list | None = None) -> bool:
+        """Check whether accumulated iter decisions (entries True / skips False)
+        admit a uniform bool — pruning patterns Phase 3 would reject. With
+        per_trace_* provided, ALSO accepts patterns realizable via interdep
+        search (counter / accumulator schemes) so we don't prune patterns
+        that the Phase-3 fallback could fit."""
         if not all_entries and not all_skips:
             return True
         all_states = all_entries + all_skips
@@ -1195,7 +1256,44 @@ class SearchOrchestrator:
         sample_inputs, _ = next(iter(instances.values()))
         input_types = tuple(type(x) for x in sample_inputs)
         bool_problem = Problem(input_types, bool, instances)
-        return self._cached_bool_search(bool_problem, var_names, max_depth) is not None
+        if self._cached_bool_search(bool_problem, var_names, max_depth) is not None:
+            return True
+        if per_trace_states is None or per_trace_labels is None:
+            return False
+        return self._cached_interdep_check(per_trace_states, per_trace_labels) is not None
+
+    def _cached_interdep_check(self, per_trace_states, per_trace_labels):
+        """Cheap interdep-search consistency check, cached on a canonicalized
+        (per_trace_states, per_trace_labels) signature."""
+        if not any(per_trace_states):
+            return None
+        common = set.intersection(*(set(s.keys()) for ts in per_trace_states for s in ts))
+        if not common:
+            return None
+        var_names = sorted(common)
+        sig = (
+            tuple(
+                tuple((tuple(s[n] for n in var_names), lbl) for s, lbl in zip(ts, lbls))
+                for ts, lbls in zip(per_trace_states, per_trace_labels)
+            ),
+            tuple(var_names),
+        )
+        cache = self._interdep_cache
+        if sig in cache:
+            return cache[sig]
+        var_types = [type(per_trace_states[0][0][n]) for n in var_names]
+        result = csr.search_boolean_traces_with_interdependence(
+            per_trace_iter_states=per_trace_states,
+            per_trace_iter_labels=per_trace_labels,
+            input_var_names=var_names,
+            input_var_types=var_types,
+            bools=self.known_bools,
+            max_init_size=1,
+            max_update_size=1,
+            bool_max_depth=2,
+        )
+        cache[sig] = result
+        return result
 
     def _cached_bool_search(self, bool_problem, input_vars, max_depth):
         """Run search_boolean_traces and extract expression, with memoization.
@@ -1252,7 +1350,7 @@ class SearchOrchestrator:
         traverse(search_state.ast_group.ast, ())
         return positions
 
-    def search_boolean_expression_while_node(self, search_state: SearchState, node_position: ASTNodePosition, max_depth=20, ast: BlockNode | None = None):
+    def search_boolean_expression_while_node(self, search_state: SearchState, node_position: ASTNodePosition, max_depth=5, ast: BlockNode | None = None):
         bool_problem, input_vars = csr.extract_while_conditional_problem_for_group(
             ast if ast is not None else search_state.ast_group.ast,
             node_position,
@@ -1296,6 +1394,60 @@ class SearchOrchestrator:
 
         return full_ast
 
+    def search_boolean_expression_while_node_with_interdependence(
+        self, search_state: SearchState, node_position: ASTNodePosition,
+        max_init_size: int = 1, max_update_size: int = 1, bool_max_depth: int = 2,
+    ):
+        """Fall-back when basic bool search fails: invent persistent state vars
+        (counters / accumulators) as part of the while condition. Returns
+        (persistent_var_names, init_stmts, update_stmts, condition_stmts) or None."""
+        states, labels, var_names, var_types = csr.extract_per_trace_iter_states_for_while(
+            node_position, search_state.trace_group.traces,
+            search_state.ast_group.annot_asts,
+        )
+        if states is None:
+            return None
+        return csr.search_boolean_traces_with_interdependence(
+            per_trace_iter_states=states,
+            per_trace_iter_labels=labels,
+            input_var_names=var_names,
+            input_var_types=var_types,
+            bools=self.known_bools,
+            max_init_size=max_init_size,
+            max_update_size=max_update_size,
+            bool_max_depth=bool_max_depth,
+        )
+
+    def integrate_boolean_expression_while_node_with_scheme(
+        self, ast: BlockNode, while_node_position: ASTNodePosition,
+        init_stmts: list, update_stmts: list, condition_stmts: list,
+    ):
+        """Like integrate_boolean_expression_while_node but ALSO splices the
+        scheme's init_stmts before the while (one-shot) and update_stmts at
+        end of body (each iter)."""
+        full_ast = ast.copy()
+        bool_expr = condition_stmts[-1]
+        helpers = condition_stmts[:-1]
+
+        full_ast.replace_node(while_node_position + (0,), bool_expr)
+
+        # Insert helpers BEFORE the while.
+        for stmt in reversed(helpers):
+            full_ast.insert_node(while_node_position, stmt)
+        # Insert init_stmts BEFORE that (so init runs first).
+        for stmt in reversed(init_stmts):
+            full_ast.insert_node(while_node_position, stmt)
+
+        new_while_pos = while_node_position[:-1] + (
+            while_node_position[-1] + len(helpers) + len(init_stmts),
+        )
+        new_while_node = full_ast.get_node_at_position(new_while_pos)
+        for stmt in helpers:
+            new_while_node.block.statements.append(stmt.copy())
+        for stmt in update_stmts:
+            new_while_node.block.statements.append(stmt.copy())
+        return full_ast
+
     def search_boolean_expressions(self, search_state: SearchState):
         full_ast = search_state.ast_group.ast.copy()
 
@@ -1314,10 +1466,20 @@ class SearchOrchestrator:
         # bool_expr children at index 0, not statement-level structure.
         for pos in reversed(self.get_while_positions(search_state)):
             stmts = self.search_boolean_expression_while_node(search_state, pos, ast=full_ast)
-            if not stmts:
+            if stmts:
+                full_ast = self.integrate_boolean_expression_while_node(full_ast, pos, stmts)
+                continue
+            # Fall back: invent persistent state vars (counter/accumulator)
+            scheme_result = self.search_boolean_expression_while_node_with_interdependence(
+                search_state, pos,
+            )
+            if scheme_result is None:
                 print('bool expr not found (while)')
                 return None
-            full_ast = self.integrate_boolean_expression_while_node(full_ast, pos, stmts)
+            _pvars, init_stmts, update_stmts, cond_stmts = scheme_result
+            full_ast = self.integrate_boolean_expression_while_node_with_scheme(
+                full_ast, pos, init_stmts, update_stmts, cond_stmts,
+            )
 
         return full_ast
 

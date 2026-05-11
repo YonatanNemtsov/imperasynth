@@ -138,10 +138,44 @@ def predecessor():
     return problem, funcs, bools
 
 
+def multiply():
+    """Multiply two ints via repeated addition. Tests the interdependent
+    bool search: the loop's exit condition needs an INVENTED counter that
+    isn't reachable from the problem inputs alone — the bool searcher has
+    to hypothesize a state var c0 with init `zero()` and update `succ(c0)`,
+    then settle on `not(eq(c0, x1))` as the while condition.
+
+    `zero` and `succ` are in `bools` so the bool/scheme searcher can use
+    them; `add` and `zero` are in `funcs` so the body can build the
+    accumulator via repeated addition."""
+    funcs = {
+        "add": Function(lambda x, y: (x + y,), [int, int], [int]),
+        "zero": Function(lambda: (0,), [], [int]),
+        
+        #"identity": Function(lambda x: (x,), [int], [int]),
+    }
+    bools = {
+        "zero": Function(lambda: (0,), [], [int]),
+        "succ": Function(lambda x: (x + 1,), [int], [int]),
+        "eq": BoolFunction(lambda x, y: (x == y,), [int, int], [bool]),
+        "not": BoolFunction(lambda b: ((not b,)), [bool], [bool]),
+    }
+    problem = Problem(
+        (int, int), (int,),
+        instances={
+            0: ((3, 2), (6,)),
+            1: ((4, 3), (12,)),
+            2: ((2, 5), (10,)),
+        },
+    )
+    return problem, funcs, bools
+
+
 ALL = {
     "max_of_two": max_of_two,
     "double_or_diff": double_or_diff,
     "sum_of_list": sum_of_list,
     "sum_of_evens": sum_of_evens,
     "predecessor": predecessor,
+    "multiply": multiply,
 }

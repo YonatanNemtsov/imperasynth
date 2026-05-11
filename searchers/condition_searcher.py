@@ -441,7 +441,6 @@ def search_boolean_traces(bool_problem: Problem, known_funcs: dict[FunctionName,
         # print(env.objects)
     
     maps = create_maps_for_conditional_problem(bool_problem, known_funcs, max_depth)
-    print(maps)
     obj_dependencies = {obj_id: set() for obj_id in traces[0].input_objects}
     for depth in range(max_depth):
         available_actions = set.intersection(*[set(get_all_available_actions(trace, comp_map)) for trace, comp_map in zip(traces, maps)])
@@ -487,18 +486,252 @@ def search_boolean_traces(bool_problem: Problem, known_funcs: dict[FunctionName,
 
 ############################### search_boolean_traces_with_interdependence ######################
 
-def search_boolean_traces_with_interdependence(bool_problem: Problem, dependent_variables_input, known_funcs: dict[FunctionName, Function], max_depth: int):
-    """ 
-    Sketch of the algorithm:
-    first, search a transformation scheme for the dependent variables. then, create maps with inputs as in the problem + scheme.
-    then, conduct a search with those maps in the same manner as search_boolean_traces, except now we can use the constraint that 
-    the dependent variables must be used in the traces, since otherwise there is no point to have them, and there is a simple 
-    solution using search_boolean_traces. Now, if a solution isn't found with the maps we got, we go on to another dependent variable
-    scheme, (increasing in complexity level of the transformation if all transformations of the lesser level are tried already). 
-    the scheme is assumed to be quite simple, so the number of iterations shouldn't be large.
+# A "scheme" is a triple (persistent_var_names, init_stmts, update_stmts):
+#   - init_stmts: list of FunctionCallAssign/DirectAssign nodes spliced before
+#     the while; runs once. Defines initial values for each persistent var.
+#   - update_stmts: list spliced at the end of the while body; runs each iter.
+#     Uses problem inputs + persistent vars (their PREVIOUS iter values) + any
+#     scratch intermediates defined earlier in the same block. Reassigns each
+#     persistent var to its new value by the block's end.
+#   - persistent_var_names: tuple of names that the bool condition can reference.
+# Scratch (intermediate) vars in init_stmts / update_stmts are NOT exposed to the
+# bool condition — they live only within their own block.
 
-    TODO: Implement. ~100 - 400 lines
+
+def _run_block(stmts: list, env: dict, func_pool: dict) -> bool:
+    """Execute init/update stmts in env (mutating). Returns False on any error."""
+    for s in stmts:
+        if isinstance(s, FunctionCallAssignNode):
+            try:
+                args = tuple(env[a] for a in s.arg_names)
+                out = func_pool[s.func_name].func(*args)
+            except Exception:
+                return False
+            outs = out if isinstance(out, (tuple, list)) else (out,)
+            for var, val in zip(s.var_names, outs):
+                env[var] = val
+        elif isinstance(s, DirectAssignNode):
+            try:
+                vals = tuple(env[a] for a in s.source_vars)
+            except KeyError:
+                return False
+            for var, val in zip(s.target_vars, vals):
+                env[var] = val
+        else:
+            return False
+    return True
+
+
+def simulate_scheme(persistent_var_names: tuple,
+                    init_stmts: list, update_stmts: list,
+                    per_trace_iter_states: list,
+                    func_pool: dict):
+    """Walk each trace's iter states. Iter 0: run init_stmts. Iter k>0: env =
+    iter-k input state UNIONED with iter-(k-1) persistent var values, then run
+    update_stmts. Returns per_trace[t][k] = {pname: value}."""
+    result = []
+    for iter_states in per_trace_iter_states:
+        prev_p: dict = {}
+        per_iter = []
+        for k, state in enumerate(iter_states):
+            env = dict(state)
+            if k == 0:
+                if not _run_block(init_stmts, env, func_pool):
+                    raise ValueError("init failed")
+            else:
+                env.update(prev_p)
+                if not _run_block(update_stmts, env, func_pool):
+                    raise ValueError("update failed")
+            current = {n: env[n] for n in persistent_var_names}
+            per_iter.append(current)
+            prev_p = current
+        result.append(per_iter)
+    return result
+
+
+def _arg_choices(input_types: list, pool: list):
+    """Yield tuples of var names from `pool` (list of (name, type)) matching input_types."""
+    if not input_types:
+        yield ()
+        return
+    options = [[n for n, t in pool if t == it] for it in input_types]
+    if any(not opts for opts in options):
+        return
+    for combo in product(*options):
+        yield combo
+
+
+def _enumerate_blocks(arg_pool: list, target_name: str, target_type,
+                      func_pool: dict, block_size: int,
+                      rebind_target: bool = False):
+    """Yield blocks of FunctionCallAssign statements producing a value of
+    `target_type`. With `rebind_target=False` (init-style), the FINAL
+    statement assigns directly to `target_name`. With `rebind_target=True`
+    (update-style), every statement assigns to fresh `s0, s1, ...` aux
+    names and a final `DirectAssign(target_name <- last_aux)` is appended;
+    `target_name` never appears as a FuncCall output. This matches the
+    rest-of-codebase convention `x3 = add(x2, x0); x2 <- x3;` and avoids
+    the awkward `c0 = succ(c0)` self-reassign form.
+
+    arg_pool: list of (name, type) — vars usable as args at block start.
+    `block_size` counts only the FuncCallAssign statements (not the final
+    DirectAssign in rebind mode).
     """
+    if block_size == 1:
+        for fname, func in func_pool.items():
+            if not func.output_types or func.output_types[0] != target_type:
+                continue
+            for args in _arg_choices(func.input_types, arg_pool):
+                if rebind_target:
+                    aux = "s0"
+                    yield [
+                        FunctionCallAssignNode([aux], fname, list(args)),
+                        DirectAssignNode((target_name,), (aux,)),
+                    ]
+                else:
+                    yield [FunctionCallAssignNode([target_name], fname, list(args))]
+        return
+
+    # block_size >= 2: emit an aux statement, recurse with extended pool.
+    for fname, func in func_pool.items():
+        if not func.output_types:
+            continue
+        s_type = func.output_types[0]
+        s_name = f"s{block_size - 1}"  # unique per recursion depth
+        for args in _arg_choices(func.input_types, arg_pool):
+            stmt = FunctionCallAssignNode([s_name], fname, list(args))
+            ext_pool = arg_pool + [(s_name, s_type)]
+            for tail in _enumerate_blocks(ext_pool, target_name, target_type,
+                                           func_pool, block_size - 1,
+                                           rebind_target=rebind_target):
+                # Constraint: tail must reference s_name (else block reduces to smaller).
+                tail_uses_s = any(s_name in t.arg_names for t in tail
+                                  if isinstance(t, FunctionCallAssignNode))
+                if not tail_uses_s:
+                    continue
+                yield [stmt] + tail
+
+
+def enumerate_schemes(input_pool: list, func_pool: dict,
+                       max_init_size: int, max_update_size: int):
+    """Yield (persistent_var_names, init_stmts, update_stmts) tuples for n=1
+    persistent var. Block sizes range 1..max_*_size. The update block must
+    reference the persistent var (else it carries no state across iters)."""
+    # Candidate persistent-var types: any function output type
+    candidate_types = {t for f in func_pool.values() for t in f.output_types}
+    pvar_name = "c0"
+    for pvar_type in candidate_types:
+        update_pool = list(input_pool) + [(pvar_name, pvar_type)]
+        for init_size in range(1, max_init_size + 1):
+            # Init: pvar doesn't exist yet, so direct-assign is fine.
+            init_blocks = list(_enumerate_blocks(
+                input_pool, pvar_name, pvar_type, func_pool, init_size,
+                rebind_target=False))
+            for upd_size in range(1, max_update_size + 1):
+                # Update: pvar already bound; emit fresh aux + final DirectAssign
+                # so `c0` doesn't appear as a FuncCall output.
+                upd_blocks = list(_enumerate_blocks(
+                    update_pool, pvar_name, pvar_type, func_pool, upd_size,
+                    rebind_target=True))
+                # Filter: update must reference pvar somewhere
+                upd_blocks = [b for b in upd_blocks
+                              if any(pvar_name in s.arg_names for s in b
+                                     if isinstance(s, FunctionCallAssignNode))]
+                for init_b in init_blocks:
+                    for upd_b in upd_blocks:
+                        yield ((pvar_name,), init_b, upd_b)
+
+
+def _stmts_use_var(stmts: list, name: str) -> bool:
+    for s in stmts:
+        if isinstance(s, FunctionCallAssignNode) and name in s.arg_names:
+            return True
+        if isinstance(s, BoolExprNode) and name in s.arg_names:
+            return True
+        if isinstance(s, DirectAssignNode) and name in s.source_vars:
+            return True
+    return False
+
+
+def extract_per_trace_iter_states_for_while(while_node_position, traces, annot_asts):
+    """Per-trace ordered (iter_states, labels) reconstructed from each trace's
+    while_iter_decisions log. Returns (states, labels, var_names, var_types) or
+    (None, None, None, None) if nothing extractable."""
+    target_pos = tuple(while_node_position)
+    states_per, labels_per = [], []
+    for trace, annot in zip(traces, annot_asts):
+        st, lb = [], []
+        for ep, vs, ent in annot.while_iter_decisions:
+            if tuple(ep[0]) != target_pos:
+                continue
+            vals = {k: trace.objects[oid].value for k, oid in vs.items()}
+            st.append(vals)
+            lb.append(bool(ent))
+        if st:
+            states_per.append(st)
+            labels_per.append(lb)
+    if not states_per:
+        return None, None, None, None
+    common = set.intersection(*(set(s.keys()) for ts in states_per for s in ts))
+    if not common:
+        return None, None, None, None
+    var_names = sorted(common)
+    sample = states_per[0][0]
+    var_types = [type(sample[n]) for n in var_names]
+    return states_per, labels_per, var_names, var_types
+
+
+def search_boolean_traces_with_interdependence(
+    per_trace_iter_states: list,
+    per_trace_iter_labels: list,
+    input_var_names: list,
+    input_var_types: list,
+    bools: dict,
+    max_init_size: int = 1,
+    max_update_size: int = 2,
+    bool_max_depth: int = 3,
+):
+    """Iterative deepening over scheme block sizes. For each scheme: simulate
+    persistent var values, augment input space, call BoolSearchEnvironment.
+    Returns (persistent_var_names, init_stmts, update_stmts, condition_stmts)
+    or None.
+    """
+    instance_to_iter = []
+    for t_idx, labels in enumerate(per_trace_iter_labels):
+        for k, lbl in enumerate(labels):
+            instance_to_iter.append((t_idx, k, lbl))
+    target_true_set = frozenset(
+        i for i, (_, _, lbl) in enumerate(instance_to_iter) if lbl
+    )
+
+    inputs_vts = tuple(
+        tuple(per_trace_iter_states[t][k][n] for (t, k, _) in instance_to_iter)
+        for n in input_var_names
+    )
+    input_pool = list(zip(input_var_names, input_var_types))
+    bool_env = BoolSearchEnvironment(bools, bools, max_depth=bool_max_depth)
+
+    for pvars, init_stmts, update_stmts in enumerate_schemes(
+            input_pool, bools, max_init_size, max_update_size):
+        try:
+            pvalues = simulate_scheme(pvars, init_stmts, update_stmts,
+                                       per_trace_iter_states, bools)
+        except Exception:
+            continue
+
+        pvar_vts = tuple(
+            tuple(pvalues[t][k][p] for (t, k, _) in instance_to_iter)
+            for p in pvars
+        )
+        aug_value_tuples = inputs_vts + pvar_vts
+        aug_var_names = list(input_var_names) + list(pvars)
+
+        parts = bool_env.realizable_partitions(aug_value_tuples, aug_var_names)
+        if target_true_set in parts:
+            _depth, condition_stmts = parts[target_true_set]
+            if any(_stmts_use_var(condition_stmts, p) for p in pvars):
+                return pvars, init_stmts, update_stmts, condition_stmts
+    return None
 
 
 ############################### bundle into a program expression ######################
@@ -647,7 +880,12 @@ class BoolSearchEnvironment:
                         new_node_id = add_node(out_vt, out_type, action_depth, (func_name, input_ids, out_idx))
                         if out_type is bool:
                             true_set = frozenset(i for i, v in enumerate(out_vt) if v)
-                            if true_set not in realizable:
+                            # Skip if add_node aliased to an existing input
+                            # (parent=None) — _reconstruct_canonical can't
+                            # express "the bool is just this input" without an
+                            # identity bool wrapper. Such partitions are
+                            # degenerate anyway (input alone IS the answer).
+                            if true_set not in realizable and nodes[new_node_id][3] is not None:
                                 realizable[true_set] = (action_depth, _reconstruct_canonical(new_node_id, nodes, input_var_names))
             if not progressed:
                 break
