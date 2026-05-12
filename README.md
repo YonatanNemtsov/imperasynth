@@ -180,7 +180,7 @@ if orch.completed_programs:
 ```
 
 A few notes:
-- `Function`/`BoolFunction` wrap a Python lambda with its input/output types. Outputs are always tuples (so `lambda: (0,)` for a constant `zero`).
+- `Function`/`BoolFunction` wrap a Python function with its input/output types. Outputs are always tuples (so `lambda: (0,)` for a constant `zero`).
 - `Problem.instances` maps an instance id to `(inputs_tuple, outputs_tuple)`.
 - `hdist` is your heuristic for "how far is value `a` from target `b`". For ints, absolute difference works; for other types, return `0` and the search relies on reachability-graph distance alone.
 - `bool_env.max_depth` caps how deep boolean expressions can nest. Default 2; bump higher when conditions need composed helpers like `not(eq(succ(x1), x0))`.
