@@ -1,64 +1,43 @@
 # Imperative Program Synthesis from Examples
 
-Synthesizes SSA-like imperative programs from input/output pairs and a set of primitive functions. [Examples below.](#examples)
+
+SSA-like imperative program synthesizer. Given input/output pairs, and a set of primitive functions, the system searches for a program that takes each input to its corresponding output. The programs are constructed in a small imperative language with if-else, while loops, function-call assignments, and direct assignments (variable-to-variable).
 
 ## Examples
 
 Each problem is defined by:
-- a set of primitive functions (typed; e.g. `add: int×int → int`),
-- a set of boolean primitives for conditions (e.g. `eq`, `not`, `is_empty`),
+- a set of primitive functions for program skeleton construction, i.e excluding conditions (typed; e.g. `add: int×int → int`),
+- a set of primitive functions for condition construction (e.g. `eq`, `not`, `is_empty`) 
 - a handful of input/output pairs.
 
-### Predecessor
 
-Given `succ` and a small number of `(x0, 0) → (x0 − 1)` pairs, the synthesizer produces:
+### Max of two
+
+Given `identity` for the body and `gt`, `not` for conditions, with pairs `{(x0, x1) -> output}: (3,7)→7, (10,4)→10, (11,1)→11, (18,23)→23`, the synthesizer produces:
 
 ```
+inputs: x0, x1
+
 {
-    b0 = succ(x1);
-    b1 = eq(b0, x0);
-    while (not(b1)) {
-        x2 = succ(x1);
-        x1 <- x2;
-        b0 = succ(x1);
-        b1 = eq(b0, x0);
+    if (gt(x1, x0)) {
+        x2 = identity(x1);
+    } else {
+        x3 = identity(x0);
+        x2 <- x3;
     }
-    return x1;
+    return x2;
 }
 ```
 
-50 steps, 0.1s.
-
-### Sum of evens
-
-Given `add`, `get_head`, `get_tail`, `zero`, `identity` plus `is_empty`, `is_even`, `not`, the synthesizer produces:
-
-```
-{
-    x1 = zero();
-    b0 = is_empty(x0);
-    while (not(b0)) {
-        x2 = get_head(x0);
-        x3 = get_tail(x0);
-        if (is_even(x2)) {
-            x4 = add(x1, x2);
-        } else {
-            x4 <- x1;
-        }
-        x0, x1 <- x3, x4;
-        b0 = is_empty(x0);
-    }
-    return x1;
-}
-```
-
-40K steps from a partial body seed, 27s. Shows `if/else` nested inside `while`.
+A single if-else returning the larger input. ~1.4K steps, ~8 seconds from an empty initial AST.
 
 ### Multiplication
 
-Given `add` and `zero` for the body plus `zero`, `succ`, `eq`, `not` for conditions, with pairs `(3,2)→6, (4,3)→12, (2,5)→10`, the synthesizer produces:
+Given `add` and `zero` for the body plus `zero`, `succ`, `eq`, `not` for conditions, with pairs `{(x0, x1) -> output}: (3,2)→6, (4,3)→12, (2,5)→10`, the synthesizer produces:
 
 ```
+inputs: x0, x1
+
 {
     x2 = zero();
     c0 = zero();                        ← invented persistent state
@@ -74,34 +53,11 @@ Given `add` and `zero` for the body plus `zero`, `succ`, `eq`, `not` for conditi
 }
 ```
 
-`c0` is not among the problem inputs and isn't reachable from them through `funcs` alone — the synthesizer hypothesized that a state variable initialized with `zero()` and updated each iteration with `succ` would let it express the exit condition. ~32K search steps, ~3 minutes from an empty initial AST.
-
-## What it can / can't do
-
-**Can:**
-- Counter-driven `while` loops (multiplication, predecessor by `succ` increment).
-- List traversals (sum-of-list, sum-of-evens with `if/else` inside `while`).
-- Single `if/else` conditionals (max-of-two, double-or-diff).
-- Invent a single auxiliary state variable as part of bool search (n=1 dep var).
-
-**Can't (yet):**
-- Recursion as a primitive — programs are iterative only.
-- Multiple invented state variables (n=2+ schemes are designed but not implemented).
-- Neural / learned priors (the search is pure cost-based enumeration with cmap pruning).
-- Library learning across problems.
-
-## Quick start
-
-```bash
-pip install -r requirements.txt
-python3 -m pytest                                            # 96 tests, ~5s
-python3 benchmarks/bench_predecessor.py --mode scratch       # x − 1, 60 steps, 0.1s
-python3 benchmarks/bench_multiply.py --mode scratch          # ~3 min, invents a counter
-```
-
-Each bench accepts `--mode {scratch,seeded,both}`, `--seed-level {tiny,body,full}`, `--max-steps N`, `--max-while N`, `--max-if N`, `--progress-every N`.
+~3 minutes from an empty initial AST.
 
 ## Benchmark numbers
+
+Numbers below are from a single CPU core. **Seed** indicates how much of the target program is pre-built before search starts: `scratch` is an empty AST, `tiny`/`body`/`full` are progressively pre-built partial programs (defined per bench, see `benchmarks/bench_*.py`). **Steps** is the number of states the orchestrator processed (popped from the priority queue) before finding a solution. Rows with `—` mean the search exhausted the step budget without finding one.
 
 | Problem | Seed | Steps | Time | Notes |
 |---|---|---|---|---|
@@ -111,8 +67,8 @@ Each bench accepts `--mode {scratch,seeded,both}`, `--seed-level {tiny,body,full
 | sum_of_evens | body | 40,463 | 27s | ✓ |
 | sum_of_evens | tiny | — | — | doesn't converge |
 | sum_of_evens | scratch | — | — | doesn't converge |
-| multiply | full | 125 | 0.55s | ✓, `--max-while 1 --max-if 0` |
-| multiply | scratch | ~32K | ~3 min | ✓, same constraints |
+| multiply | full | 125 | 0.55s | ✓ |
+| multiply | scratch | ~32K | ~3 min | ✓ |
 | sum_of_list | full | 9 | <0.1s | ✓ |
 | sum_of_list | scratch | 21,631 | 6.3s | ✓, `--max-while 1 --max-if 0` |
 
@@ -130,7 +86,7 @@ A priority queue picks which partial program to expand next. Smaller programs go
 
 ## Defining your own problem
 
-Here's a problem where the output depends on parity: if `x0` is even, return `x0 + x1`; if odd, return `x0 - x1`. Four examples, no seed.
+Here's a problem where the output depends on parity: if `x0 > x1` return `x0 + x1`; else, return `x0 - x1`. Four examples, no seed.
 
 ```python
 from core_lang_env.comp_env import Function, BoolFunction
@@ -146,7 +102,7 @@ funcs = {
 
 # Primitives the synthesizer can use inside boolean conditions.
 bools = {
-    "is_even": BoolFunction(lambda x: (x % 2 == 0,), [int], [bool]),
+    "gt": BoolFunction(lambda x, y: (x > y,), [int, int], [bool]),
     "not":     BoolFunction(lambda b: (not b,), [bool], [bool]),
 }
 
@@ -154,10 +110,10 @@ problem = Problem(
     input_types=(int, int),
     output_types=(int,),
     instances={
-        0: ((4, 3), (7,)),    # 4 is even → 4 + 3
-        1: ((2, 5), (7,)),    # 2 is even → 2 + 5
-        2: ((3, 8), (-5,)),   # 3 is odd  → 3 − 8
-        3: ((7, 1), (6,)),    # 7 is odd  → 7 − 1
+        0: ((4, 3), (7,)),    # 4 > 3 → 4 + 3 = 7
+        1: ((8, 2), (10,)),   # 8 > 2 → 8 + 2 = 10
+        2: ((3, 5), (-2,)),   # 3 < 5 → 3 − 5 = −2
+        3: ((1, 4), (-3,)),   # 1 < 4 → 1 − 4 = −3
     },
 )
 
@@ -188,6 +144,19 @@ A few notes:
 - Completed programs are full ASTs; `ast_to_code_str` pretty-prints them.
 
 The `benchmarks/` directory has full driver scripts showing the same pattern with progress prints, seeded starts, and reporting.
+
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+python3 -m pytest                                            # 96 tests, ~5s
+python3 benchmarks/bench_predecessor.py --mode scratch       # x − 1, 60 steps, 0.1s
+python3 benchmarks/bench_multiply.py --mode scratch          # ~3 min, invents a counter
+```
+
+Each bench accepts `--mode {scratch,seeded,both}`, `--seed-level {tiny,body,full}`, `--max-steps N`, `--max-while N`, `--max-if N`, `--progress-every N`.
+
 
 ## Repository layout
 
